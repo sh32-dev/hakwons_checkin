@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "923124437944",
+    "project_id": "hakwons",
+    "storage_bucket": "hakwons.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:923124437944:android:64433d74018a3c42bd754d",
+        "android_client_info": {
+          "package_name": "com.hagwons.hagwons_checkin"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAn1kJ83efG2D0k0oSYLvk7CLj0llCK5_k"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:923124437944:android:b7d445e4a9bec6dcbd754d",
+        "android_client_info": {
+          "package_name": "com.hakwons.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAn1kJ83efG2D0k0oSYLvk7CLj0llCK5_k"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
