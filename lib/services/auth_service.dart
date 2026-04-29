@@ -7,6 +7,7 @@ class AuthService {
   static const _keyAcademyId = 'academy_id';
   static const _keyAcademyName = 'academy_name';
   static const _keyPhone = 'phone_number';
+  static const _keyActorRole = 'actor_role';
 
   // ── 저장된 세션 복원 ────────────────────────────────────
   static Future<AcademySession?> getSavedSession() async {
@@ -14,11 +15,13 @@ class AuthService {
     final academyId = prefs.getString(_keyAcademyId);
     final academyName = prefs.getString(_keyAcademyName);
     final phone = prefs.getString(_keyPhone);
+    final actorRole = prefs.getString(_keyActorRole) ?? 'director';
     if (academyId == null || academyName == null || phone == null) return null;
     return AcademySession(
       academyId: academyId,
       academyName: academyName,
       phoneNumber: phone,
+      actorRole: actorRole,
     );
   }
 
@@ -70,10 +73,12 @@ class AuthService {
     await prefs.setString(_keyAcademyId, 'test_academy');
     await prefs.setString(_keyAcademyName, '테스트 학원');
     await prefs.setString(_keyPhone, phoneNumber);
+    await prefs.setString(_keyActorRole, 'director');
     return AcademySession(
       academyId: 'test_academy',
       academyName: '테스트 학원',
       phoneNumber: phoneNumber,
+      actorRole: 'director',
     );
   }
 
@@ -84,6 +89,7 @@ class AuthService {
     await prefs.remove(_keyAcademyId);
     await prefs.remove(_keyAcademyName);
     await prefs.remove(_keyPhone);
+    await prefs.remove(_keyActorRole);
   }
 
   // ── 내부 공통 로그인 처리 ───────────────────────────────
@@ -94,32 +100,57 @@ class AuthService {
     final result = await FirebaseAuth.instance.signInWithCredential(credential);
     final uid = result.user!.uid;
 
-    // academies 컬렉션에서 학원 정보 조회
-    final doc = await FirebaseFirestore.instance
-        .collection('academies')
-        .doc(uid)
-        .get();
+    final firestore = FirebaseFirestore.instance;
+    final userDoc = await firestore.collection('users').doc(uid).get();
+    final userData = userDoc.data();
 
     final String academyId;
     final String academyName;
+    final String actorRole;
 
-    if (doc.exists && doc.data() != null) {
-      academyId = doc.data()!['academyId'] as String? ?? uid;
-      academyName = doc.data()!['name'] as String? ?? '내 학원';
+    final userAcademyId =
+        userData?['academyId'] as String? ??
+        userData?['associatedAcademyId'] as String? ??
+        userData?['activeAcademyId'] as String?;
+    final role =
+        userData?['role'] as String? ?? userData?['activeRole'] as String?;
+
+    if (userAcademyId != null && userAcademyId.isNotEmpty) {
+      academyId = userAcademyId;
+      actorRole = role == 'teacher' ? 'teacher' : 'director';
     } else {
-      academyId = uid;
-      academyName = '내 학원';
+      final academySnap = await firestore
+          .collection('academies')
+          .where('directorUid', isEqualTo: uid)
+          .limit(1)
+          .get();
+      if (academySnap.docs.isEmpty) {
+        throw FirebaseAuthException(
+          code: 'academy-not-found',
+          message: '연결된 학원 정보를 찾을 수 없습니다.',
+        );
+      }
+      academyId = academySnap.docs.first.id;
+      actorRole = 'director';
     }
+
+    final academyDoc = await firestore
+        .collection('academies')
+        .doc(academyId)
+        .get();
+    academyName = academyDoc.data()?['name'] as String? ?? '내 학원';
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_keyAcademyId, academyId);
     await prefs.setString(_keyAcademyName, academyName);
     await prefs.setString(_keyPhone, phoneNumber);
+    await prefs.setString(_keyActorRole, actorRole);
 
     return AcademySession(
       academyId: academyId,
       academyName: academyName,
       phoneNumber: phoneNumber,
+      actorRole: actorRole,
     );
   }
 

@@ -33,20 +33,21 @@ class AttendanceService {
   static final _dateFormat = DateFormat('yyyy-MM-dd');
 
   static Future<AttendanceResult> processTag({
-    required String nfcUid,
+    required String attendanceCardId,
     required String academyId,
+    required String actorRole,
   }) async {
     try {
-      // 1. NFC UID + academyId로 학생 조회 (복합 인덱스 필요)
+      // 1. attendanceCardId + academyId로 학생 조회 (복합 인덱스 필요)
       final studentSnap = await _firestore
           .collection('students')
           .where('academyId', isEqualTo: academyId)
-          .where('nfcUid', isEqualTo: nfcUid)
+          .where('attendanceCardId', isEqualTo: attendanceCardId)
           .limit(1)
           .get();
 
       if (studentSnap.docs.isEmpty) {
-        return AttendanceUnknownCard(uid: nfcUid);
+        return AttendanceUnknownCard(uid: attendanceCardId);
       }
 
       final student = Student.fromFirestore(studentSnap.docs.first);
@@ -55,6 +56,7 @@ class AttendanceService {
       final today = _dateFormat.format(DateTime.now());
       final attendanceSnap = await _firestore
           .collection('attendance')
+          .where('academyId', isEqualTo: academyId)
           .where('studentId', isEqualTo: student.id)
           .where('date', isEqualTo: today)
           .orderBy('timestamp', descending: true)
@@ -87,6 +89,10 @@ class AttendanceService {
         'studentName': student.name,
         'academyId': academyId,
         'type': nextType == AttendanceType.arrival ? 'arrival' : 'departure',
+        'status': nextType == AttendanceType.arrival ? 'present' : 'departed',
+        'lastEditedByRole': actorRole == 'teacher' ? 'teacher' : 'director',
+        'editedByAdmin': false,
+        'source': 'checkin_app',
         'timestamp': FieldValue.serverTimestamp(),
         'date': today,
       });
@@ -96,5 +102,4 @@ class AttendanceService {
       return AttendanceError(message: e.toString());
     }
   }
-
 }
