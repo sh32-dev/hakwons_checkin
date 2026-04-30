@@ -1,11 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:nfc_manager/nfc_manager.dart';
-import 'package:nfc_manager/platform_tags.dart';
 
 import '../models/academy_session.dart';
 import '../models/attendance_record.dart';
@@ -13,7 +14,6 @@ import '../services/attendance_service.dart';
 import '../services/auth_service.dart';
 
 enum _FeedbackKind { success, duplicate, unknown, error }
-
 
 class _Feedback {
   final _FeedbackKind kind;
@@ -60,11 +60,14 @@ class _CheckinScreenState extends State<CheckinScreen>
       vsync: this,
       duration: const Duration(milliseconds: 350),
     );
-    _overlayOpacity =
-        CurvedAnimation(parent: _overlayCtrl, curve: Curves.easeOut);
-    _cardScale = Tween<double>(begin: 0.82, end: 1.0).animate(
-      CurvedAnimation(parent: _overlayCtrl, curve: Curves.easeOutBack),
+    _overlayOpacity = CurvedAnimation(
+      parent: _overlayCtrl,
+      curve: Curves.easeOut,
     );
+    _cardScale = Tween<double>(
+      begin: 0.82,
+      end: 1.0,
+    ).animate(CurvedAnimation(parent: _overlayCtrl, curve: Curves.easeOutBack));
     _startNfc();
   }
 
@@ -80,10 +83,12 @@ class _CheckinScreenState extends State<CheckinScreen>
   Future<void> _startNfc() async {
     final available = await NfcManager.instance.isAvailable();
     if (!available) {
-      _showFeedback(const _Feedback(
-        kind: _FeedbackKind.error,
-        message: 'NFC를 사용할 수 없습니다.\n기기 설정에서 NFC를 활성화해주세요.',
-      ));
+      _showFeedback(
+        const _Feedback(
+          kind: _FeedbackKind.error,
+          message: 'NFC를 사용할 수 없습니다.\n기기 설정에서 NFC를 활성화해주세요.',
+        ),
+      );
       return;
     }
     NfcManager.instance.startSession(onDiscovered: _onTag);
@@ -93,41 +98,50 @@ class _CheckinScreenState extends State<CheckinScreen>
     if (_isProcessing) return;
     _isProcessing = true;
 
-    final uid = _extractUid(tag);
-    if (uid == null) {
-      _showFeedback(const _Feedback(
-        kind: _FeedbackKind.error,
-        message: '카드를 인식하지 못했습니다.\n다시 태깅해주세요.',
-      ));
+    final cardId = await _extractAttendanceCardId(tag);
+    if (cardId == null) {
+      _showFeedback(
+        const _Feedback(
+          kind: _FeedbackKind.error,
+          message: '카드 일련번호를 읽지 못했습니다.\nNDEF Text가 저장된 카드인지 확인해주세요.',
+        ),
+      );
       return;
     }
-    await _processUid(uid);
+    await _processUid(cardId);
   }
 
   Future<void> _processUid(String uid) async {
     final result = await AttendanceService.processTag(
-      nfcUid: uid,
+      attendanceCardId: uid,
       academyId: widget.session.academyId,
+      actorRole: widget.session.actorRole,
     );
 
     switch (result) {
       case AttendanceSuccess(:final student, :final type):
-        _showFeedback(_Feedback(
-          kind: _FeedbackKind.success,
-          studentName: student.name,
-          attendanceType: type,
-        ));
+        _showFeedback(
+          _Feedback(
+            kind: _FeedbackKind.success,
+            studentName: student.name,
+            attendanceType: type,
+          ),
+        );
       case AttendanceDuplicate(:final student, :final lastType):
-        _showFeedback(_Feedback(
-          kind: _FeedbackKind.duplicate,
-          studentName: student.name,
-          attendanceType: lastType,
-        ));
+        _showFeedback(
+          _Feedback(
+            kind: _FeedbackKind.duplicate,
+            studentName: student.name,
+            attendanceType: lastType,
+          ),
+        );
       case AttendanceUnknownCard():
-        _showFeedback(const _Feedback(
-          kind: _FeedbackKind.unknown,
-          message: '등록되지 않은 카드입니다.',
-        ));
+        _showFeedback(
+          const _Feedback(
+            kind: _FeedbackKind.unknown,
+            message: '등록되지 않은 카드입니다.',
+          ),
+        );
       case AttendanceError(:final message):
         _showFeedback(_Feedback(kind: _FeedbackKind.error, message: message));
     }
@@ -145,11 +159,13 @@ class _CheckinScreenState extends State<CheckinScreen>
     // ① 20분 중복 체크 — 순수 in-memory, 네트워크 완전 무관
     final lastTime = _lastTestTagTime;
     if (lastTime != null && now.difference(lastTime) < duplicateWindow) {
-      _showFeedback(_Feedback(
-        kind: _FeedbackKind.duplicate,
-        studentName: mockName,
-        attendanceType: _lastTestTagType,
-      ));
+      _showFeedback(
+        _Feedback(
+          kind: _FeedbackKind.duplicate,
+          studentName: mockName,
+          attendanceType: _lastTestTagType,
+        ),
+      );
       return;
     }
 
@@ -171,33 +187,56 @@ class _CheckinScreenState extends State<CheckinScreen>
     });
 
     // ④ Firestore 저장 — fire-and-forget (await 없음 → 무반응 버그 해결)
-    FirebaseFirestore.instance.collection('attendance').add({
-      'studentId': '__mock_student__',
-      'studentName': mockName,
-      'academyId': widget.session.academyId,
-      'type': nextType == AttendanceType.arrival ? 'arrival' : 'departure',
-      'timestamp': Timestamp.fromDate(now),
-      'date': DateFormat('yyyy-MM-dd').format(now),
-    }).catchError((_) {});
+    unawaited(
+      FirebaseFirestore.instance
+          .collection('attendance')
+          .add({
+            'studentId': '__mock_student__',
+            'studentName': mockName,
+            'academyId': widget.session.academyId,
+            'type': nextType == AttendanceType.arrival
+                ? 'arrival'
+                : 'departure',
+            'status': nextType == AttendanceType.arrival
+                ? 'present'
+                : 'departed',
+            'lastEditedByRole': widget.session.actorRole == 'teacher'
+                ? 'teacher'
+                : 'director',
+            'editedByAdmin': false,
+            'source': 'checkin_app',
+            'timestamp': Timestamp.fromDate(now),
+            'date': DateFormat('yyyy-MM-dd').format(now),
+          })
+          .then<void>((_) {})
+          .catchError((_) {}),
+    );
 
     // ⑤ 성공 오버레이 즉시 표시
-    _showFeedback(_Feedback(
-      kind: _FeedbackKind.success,
-      studentName: mockName,
-      attendanceType: nextType,
-    ));
+    _showFeedback(
+      _Feedback(
+        kind: _FeedbackKind.success,
+        studentName: mockName,
+        attendanceType: nextType,
+      ),
+    );
   }
 
-  String? _extractUid(NfcTag tag) {
-    final id = NfcA.from(tag)?.identifier ??
-        NfcB.from(tag)?.identifier ??
-        NfcF.from(tag)?.identifier ??
-        NfcV.from(tag)?.identifier ??
-        IsoDep.from(tag)?.identifier ??
-        MifareClassic.from(tag)?.identifier ??
-        MifareUltralight.from(tag)?.identifier;
-    if (id == null) return null;
-    return id.map((b) => b.toRadixString(16).padLeft(2, '0')).join('').toUpperCase();
+  Future<String?> _extractAttendanceCardId(NfcTag tag) async {
+    final ndef = Ndef.from(tag);
+    final message = ndef?.cachedMessage ?? await ndef?.read();
+    final text = _firstTextRecordValue(message);
+    if (text == null || text.isEmpty) return null;
+    return text.replaceAll(RegExp(r'[\s:-]'), '').toUpperCase();
+  }
+
+  String? _firstTextRecordValue(NdefMessage? message) {
+    if (message == null) return null;
+    for (final record in message.records) {
+      final text = decodeNdefTextRecord(record);
+      if (text != null && text.isNotEmpty) return text;
+    }
+    return null;
   }
 
   // ── 피드백 오버레이 제어 ─────────────────────────────────
@@ -226,25 +265,29 @@ class _CheckinScreenState extends State<CheckinScreen>
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1E1E2E),
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('로그아웃',
-            style: TextStyle(color: Colors.white, fontSize: 18)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text(
+          '로그아웃',
+          style: TextStyle(color: Colors.white, fontSize: 18),
+        ),
         content: Text(
           '${widget.session.academyName} 계정에서 로그아웃하시겠습니까?',
-          style:
-              TextStyle(color: Colors.white.withValues(alpha: 0.65), fontSize: 14),
+          style: TextStyle(
+            color: Colors.white.withValues(alpha: 0.65),
+            fontSize: 14,
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child:
-                const Text('취소', style: TextStyle(color: Colors.white38)),
+            child: const Text('취소', style: TextStyle(color: Colors.white38)),
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('로그아웃',
-                style: TextStyle(color: Colors.redAccent)),
+            child: const Text(
+              '로그아웃',
+              style: TextStyle(color: Colors.redAccent),
+            ),
           ),
         ],
       ),
@@ -303,11 +346,16 @@ class _CheckinScreenState extends State<CheckinScreen>
                   Text(
                     widget.session.academyName,
                     style: const TextStyle(
-                        fontSize: 11, color: Color(0x66FFFFFF)),
+                      fontSize: 11,
+                      color: Color(0x66FFFFFF),
+                    ),
                   ),
                   const SizedBox(width: 6),
-                  const Icon(Icons.logout_rounded,
-                      size: 15, color: Color(0x44FFFFFF)),
+                  const Icon(
+                    Icons.logout_rounded,
+                    size: 15,
+                    color: Color(0x44FFFFFF),
+                  ),
                 ],
               ),
             ),
@@ -316,6 +364,46 @@ class _CheckinScreenState extends State<CheckinScreen>
       ),
     );
   }
+}
+
+@visibleForTesting
+String? decodeNdefTextRecord(dynamic record) {
+  final type = record?.type;
+  final payload = record?.payload;
+  if (type is! Uint8List || payload is! Uint8List || payload.isEmpty) {
+    return null;
+  }
+  if (ascii.decode(type, allowInvalid: true) != 'T') return null;
+
+  final status = payload.first;
+  final languageCodeLength = status & 0x3F;
+  final textOffset = 1 + languageCodeLength;
+  if (payload.length <= textOffset) return null;
+
+  final textBytes = payload.sublist(textOffset);
+  final isUtf16 = (status & 0x80) != 0;
+  final decoded = isUtf16
+      ? String.fromCharCodes(_utf16CodeUnits(textBytes))
+      : utf8.decode(textBytes, allowMalformed: true);
+  return decoded.trim().toUpperCase();
+}
+
+List<int> _utf16CodeUnits(Uint8List bytes) {
+  final hasBom =
+      bytes.length >= 2 &&
+      ((bytes[0] == 0xFE && bytes[1] == 0xFF) ||
+          (bytes[0] == 0xFF && bytes[1] == 0xFE));
+  final littleEndian = hasBom && bytes[0] == 0xFF;
+  final start = hasBom ? 2 : 0;
+  final codeUnits = <int>[];
+  for (var i = start; i + 1 < bytes.length; i += 2) {
+    codeUnits.add(
+      littleEndian
+          ? (bytes[i] | (bytes[i + 1] << 8))
+          : ((bytes[i] << 8) | bytes[i + 1]),
+    );
+  }
+  return codeUnits;
 }
 
 // ══════════════════════════════════════════════════════════
@@ -377,12 +465,16 @@ class _LeftPanel extends StatelessWidget {
                       color: Colors.white.withValues(alpha: 0.18),
                       shape: BoxShape.circle,
                       border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.35),
-                          width: 1.5),
+                        color: Colors.white.withValues(alpha: 0.35),
+                        width: 1.5,
+                      ),
                     ),
                   ),
-                  const Icon(Icons.contactless_rounded,
-                      size: 52, color: Colors.white),
+                  const Icon(
+                    Icons.contactless_rounded,
+                    size: 52,
+                    color: Colors.white,
+                  ),
                 ],
               ),
               const SizedBox(height: 20),
@@ -410,14 +502,46 @@ class _BlobPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final blobs = [
-      (Offset(size.width * 0.12, size.height * 0.20), 160.0, const Color(0xFFCDB4DB)),
-      (Offset(size.width * 0.55, size.height * 0.12), 140.0, const Color(0xFFFFC8DD)),
-      (Offset(size.width * 0.30, size.height * 0.78), 150.0, const Color(0xFFBDE0FE)),
-      (Offset(size.width * 0.82, size.height * 0.60), 120.0, const Color(0xFFA2D2FF)),
-      (Offset(size.width * 0.08, size.height * 0.72), 110.0, const Color(0xFFFFAFCC)),
-      (Offset(size.width * 0.72, size.height * 0.28), 130.0, const Color(0xFFE2CFFF)),
-      (Offset(size.width * 0.48, size.height * 0.50), 100.0, const Color(0xFFC9F0FF)),
-      (Offset(size.width * 0.90, size.height * 0.15), 90.0, const Color(0xFFFFC8DD)),
+      (
+        Offset(size.width * 0.12, size.height * 0.20),
+        160.0,
+        const Color(0xFFCDB4DB),
+      ),
+      (
+        Offset(size.width * 0.55, size.height * 0.12),
+        140.0,
+        const Color(0xFFFFC8DD),
+      ),
+      (
+        Offset(size.width * 0.30, size.height * 0.78),
+        150.0,
+        const Color(0xFFBDE0FE),
+      ),
+      (
+        Offset(size.width * 0.82, size.height * 0.60),
+        120.0,
+        const Color(0xFFA2D2FF),
+      ),
+      (
+        Offset(size.width * 0.08, size.height * 0.72),
+        110.0,
+        const Color(0xFFFFAFCC),
+      ),
+      (
+        Offset(size.width * 0.72, size.height * 0.28),
+        130.0,
+        const Color(0xFFE2CFFF),
+      ),
+      (
+        Offset(size.width * 0.48, size.height * 0.50),
+        100.0,
+        const Color(0xFFC9F0FF),
+      ),
+      (
+        Offset(size.width * 0.90, size.height * 0.15),
+        90.0,
+        const Color(0xFFFFC8DD),
+      ),
     ];
 
     for (final (offset, radius, color) in blobs) {
@@ -444,8 +568,10 @@ class _RightPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-    final todayLabel =
-        DateFormat('yyyy.MM.dd (E)', 'ko').format(DateTime.now());
+    final todayLabel = DateFormat(
+      'yyyy.MM.dd (E)',
+      'ko',
+    ).format(DateTime.now());
 
     return Container(
       color: const Color(0xFFF8F9FA),
@@ -459,8 +585,7 @@ class _RightPanel extends StatelessWidget {
             decoration: BoxDecoration(
               color: const Color(0xFFF8F9FA),
               border: Border(
-                bottom: BorderSide(
-                    color: Colors.black.withValues(alpha: 0.07)),
+                bottom: BorderSide(color: Colors.black.withValues(alpha: 0.07)),
               ),
             ),
             child: Column(
@@ -499,7 +624,9 @@ class _RightPanel extends StatelessWidget {
                 Text(
                   todayLabel,
                   style: const TextStyle(
-                      fontSize: 13, color: Color(0xFF212121)),
+                    fontSize: 13,
+                    color: Color(0xFF212121),
+                  ),
                 ),
               ],
             ),
@@ -536,18 +663,17 @@ class _RightPanel extends StatelessWidget {
                           endIndent: 18,
                         ),
                         itemBuilder: (_, i) {
-                          final data =
-                              docs[i].data() as Map<String, dynamic>;
+                          final data = docs[i].data() as Map<String, dynamic>;
                           final ts = data['timestamp'] as Timestamp?;
                           final time = ts != null
-                              ? DateFormat('HH:mm')
-                                  .format(ts.toDate().toLocal())
+                              ? DateFormat(
+                                  'HH:mm',
+                                ).format(ts.toDate().toLocal())
                               : DateFormat('HH:mm').format(DateTime.now());
                           return _AttendanceItem(
                             name: data['studentName'] as String? ?? '',
                             time: time,
-                            isArrival:
-                                (data['type'] as String?) == 'arrival',
+                            isArrival: (data['type'] as String?) == 'arrival',
                           );
                         },
                       );
@@ -589,22 +715,25 @@ class _LocalList extends StatelessWidget {
 class _EmptyList extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.people_outline_rounded,
-                size: 40,
-                color: const Color(0xFF2D2D2D).withValues(alpha: 0.18)),
-            const SizedBox(height: 10),
-            Text(
-              '아직 기록이 없습니다.',
-              style: TextStyle(
-                  fontSize: 13,
-                  color: const Color(0xFF2D2D2D).withValues(alpha: 0.35)),
-            ),
-          ],
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          Icons.people_outline_rounded,
+          size: 40,
+          color: const Color(0xFF2D2D2D).withValues(alpha: 0.18),
         ),
-      );
+        const SizedBox(height: 10),
+        Text(
+          '아직 기록이 없습니다.',
+          style: TextStyle(
+            fontSize: 13,
+            color: const Color(0xFF2D2D2D).withValues(alpha: 0.35),
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 class _AttendanceItem extends StatelessWidget {
@@ -634,9 +763,10 @@ class _AttendanceItem extends StatelessWidget {
             child: Text(
               name.isNotEmpty ? name[0] : '?',
               style: TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.bold,
-                  color: accent),
+                fontSize: 15,
+                fontWeight: FontWeight.bold,
+                color: accent,
+              ),
             ),
           ),
           const SizedBox(width: 12),
@@ -656,7 +786,9 @@ class _AttendanceItem extends StatelessWidget {
                 const SizedBox(height: 3),
                 Container(
                   padding: const EdgeInsets.symmetric(
-                      horizontal: 7, vertical: 2),
+                    horizontal: 7,
+                    vertical: 2,
+                  ),
                   decoration: BoxDecoration(
                     color: accent.withValues(alpha: 0.1),
                     borderRadius: BorderRadius.circular(20),
@@ -664,9 +796,10 @@ class _AttendanceItem extends StatelessWidget {
                   child: Text(
                     isArrival ? '등원' : '하원',
                     style: TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                        color: accent),
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700,
+                      color: accent,
+                    ),
                   ),
                 ),
               ],
@@ -675,9 +808,10 @@ class _AttendanceItem extends StatelessWidget {
           Text(
             time,
             style: const TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w500,
-                color: Color(0xFF999999)),
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+              color: Color(0xFF999999),
+            ),
           ),
         ],
       ),
@@ -696,16 +830,16 @@ class _FeedbackCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return switch (feedback.kind) {
       _FeedbackKind.success => _SuccessCard(
-          name: feedback.studentName ?? '',
-          isArrival: feedback.attendanceType == AttendanceType.arrival,
-        ),
+        name: feedback.studentName ?? '',
+        isArrival: feedback.attendanceType == AttendanceType.arrival,
+      ),
       _FeedbackKind.duplicate => _DuplicateCard(
-          name: feedback.studentName ?? '',
-        ),
+        name: feedback.studentName ?? '',
+      ),
       _FeedbackKind.unknown || _FeedbackKind.error => _AlertCard(
-          message: feedback.message ?? '오류가 발생했습니다.',
-          isError: feedback.kind == _FeedbackKind.error,
-        ),
+        message: feedback.message ?? '오류가 발생했습니다.',
+        isError: feedback.kind == _FeedbackKind.error,
+      ),
     };
   }
 }
@@ -718,11 +852,10 @@ class _SuccessCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final accent =
-        isArrival ? const Color(0xFF4CAF50) : const Color(0xFFFF9800);
-    final bg = isArrival
-        ? const Color(0xFF1B2E1B)
-        : const Color(0xFF2E1F0A);
+    final accent = isArrival
+        ? const Color(0xFF4CAF50)
+        : const Color(0xFFFF9800);
+    final bg = isArrival ? const Color(0xFF1B2E1B) : const Color(0xFF2E1F0A);
 
     return Container(
       width: 340,
@@ -785,7 +918,9 @@ class _DuplicateCard extends StatelessWidget {
         color: const Color(0xFF2A2200).withValues(alpha: 0.92),
         borderRadius: BorderRadius.circular(28),
         border: Border.all(
-            color: Colors.amber.withValues(alpha: 0.5), width: 1.5),
+          color: Colors.amber.withValues(alpha: 0.5),
+          width: 1.5,
+        ),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withValues(alpha: 0.35),
@@ -797,30 +932,32 @@ class _DuplicateCard extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.timer_outlined,
-              size: 56, color: Colors.amber.shade300),
+          Icon(Icons.timer_outlined, size: 56, color: Colors.amber.shade300),
           const SizedBox(height: 18),
           Text(
             name,
             style: const TextStyle(
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
-                color: Colors.white),
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+            ),
           ),
           const SizedBox(height: 10),
           Text(
             '이미 기록되었습니다.',
             style: TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.w600,
-                color: Colors.amber.shade300),
+              fontSize: 20,
+              fontWeight: FontWeight.w600,
+              color: Colors.amber.shade300,
+            ),
           ),
           const SizedBox(height: 6),
           Text(
             '20분 이내 중복 태깅은 기록되지 않습니다.',
             style: TextStyle(
-                fontSize: 12,
-                color: Colors.white.withValues(alpha: 0.4)),
+              fontSize: 12,
+              color: Colors.white.withValues(alpha: 0.4),
+            ),
           ),
         ],
       ),
@@ -836,8 +973,7 @@ class _AlertCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final accent =
-        isError ? Colors.redAccent.shade200 : Colors.orangeAccent;
+    final accent = isError ? Colors.redAccent.shade200 : Colors.orangeAccent;
 
     return Container(
       width: 340,
@@ -845,8 +981,7 @@ class _AlertCard extends StatelessWidget {
       decoration: BoxDecoration(
         color: const Color(0xFF200000).withValues(alpha: 0.92),
         borderRadius: BorderRadius.circular(28),
-        border:
-            Border.all(color: accent.withValues(alpha: 0.5), width: 1.5),
+        border: Border.all(color: accent.withValues(alpha: 0.5), width: 1.5),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withValues(alpha: 0.35),
