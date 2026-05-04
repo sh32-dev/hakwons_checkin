@@ -1,31 +1,76 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:typed_data';
+import 'dart:collection';
+import 'dart:developer' as developer;
 import 'dart:ui' as ui;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
-import 'package:nfc_manager/nfc_manager.dart';
 
 import '../models/academy_session.dart';
 import '../models/attendance_record.dart';
 import '../services/attendance_service.dart';
 import '../services/auth_service.dart';
+import '../services/usb_nfc_reader_service.dart';
 
 enum _FeedbackKind { success, duplicate, unknown, error }
+
+final Map<String, Future<String?>> _studentClassNameFutures = {};
 
 class _Feedback {
   final _FeedbackKind kind;
   final String? studentName;
+  final String? studentClassName;
   final AttendanceType? attendanceType;
   final String? message;
 
   const _Feedback({
     required this.kind,
     this.studentName,
+    this.studentClassName,
     this.attendanceType,
     this.message,
+  });
+}
+
+String _formatStudentDisplayName(String name, String? className) {
+  final trimmedName = name.trim();
+  final trimmedClassName = className?.trim();
+  if (trimmedClassName == null || trimmedClassName.isEmpty) {
+    return trimmedName;
+  }
+  return '$trimmedName ($trimmedClassName)';
+}
+
+bool _hasText(String? value) => value != null && value.trim().isNotEmpty;
+
+Future<String?> _fetchStudentClassName({
+  required String academyId,
+  required String studentId,
+}) {
+  final cacheKey = '$academyId/$studentId';
+  return _studentClassNameFutures.putIfAbsent(cacheKey, () async {
+    try {
+      final firestore = FirebaseFirestore.instance;
+      final studentDoc = await firestore
+          .collection('students')
+          .doc(studentId)
+          .get();
+      final classId = studentDoc.data()?['classId'] as String?;
+      if (!_hasText(classId)) return null;
+
+      final classDoc = await firestore
+          .collection('academies')
+          .doc(academyId)
+          .collection('classes')
+          .doc(classId!.trim())
+          .get();
+      final className = classDoc.data()?['name'] as String?;
+      if (!_hasText(className)) return null;
+      return className!.trim();
+    } catch (_) {
+      return null;
+    }
   });
 }
 
@@ -45,13 +90,12 @@ class _CheckinScreenState extends State<CheckinScreen>
   late final Animation<double> _cardScale;
 
   bool _isProcessing = false;
+  bool _isSavingAttendance = false;
+  String? _processingCardId;
   _Feedback? _feedback;
   Timer? _dismissTimer;
-
-  // ── [TEST ONLY] 가상 태깅 in-memory 상태 — 배포 시 삭제 ──
-  DateTime? _lastTestTagTime;
-  AttendanceType? _lastTestTagType;
-  final List<Map<String, dynamic>> _testLocalRecords = [];
+  StreamSubscription<UsbNfcReaderEvent>? _readerSubscription;
+  final Queue<String> _cardQueue = Queue<String>();
 
   @override
   void initState() {
@@ -68,62 +112,124 @@ class _CheckinScreenState extends State<CheckinScreen>
       begin: 0.82,
       end: 1.0,
     ).animate(CurvedAnimation(parent: _overlayCtrl, curve: Curves.easeOutBack));
-    _startNfc();
+    _startUsbReader();
   }
 
   @override
   void dispose() {
     _overlayCtrl.dispose();
     _dismissTimer?.cancel();
-    NfcManager.instance.stopSession();
+    _readerSubscription?.cancel();
+    unawaited(UsbNfcReaderService.stop());
     super.dispose();
   }
 
-  // ── NFC ─────────────────────────────────────────────────
-  Future<void> _startNfc() async {
-    final available = await NfcManager.instance.isAvailable();
-    if (!available) {
+  // ── ACR122U USB 리더기 ───────────────────────────────────
+  Future<void> _startUsbReader() async {
+    _readerSubscription = UsbNfcReaderService.events().listen(
+      _handleReaderEvent,
+      onError: (_) {
+        _showFeedback(
+          const _Feedback(
+            kind: _FeedbackKind.error,
+            message: 'USB 리더기 연결을 확인해주세요.',
+          ),
+        );
+      },
+    );
+
+    try {
+      await UsbNfcReaderService.start();
+    } catch (_) {
       _showFeedback(
         const _Feedback(
           kind: _FeedbackKind.error,
-          message: 'NFC를 사용할 수 없습니다.\n기기 설정에서 NFC를 활성화해주세요.',
+          message: 'USB 리더기를 시작하지 못했습니다.\n연결과 권한을 확인해주세요.',
+        ),
+      );
+    }
+  }
+
+  void _handleReaderEvent(UsbNfcReaderEvent event) {
+    switch (event) {
+      case UsbNfcReaderUid(:final uid):
+        _onReaderUid(uid);
+      case UsbNfcReaderError(:final message):
+        _showFeedback(_Feedback(kind: _FeedbackKind.error, message: message));
+      case UsbNfcReaderStatus(:final message):
+        developer.log(message, name: 'UsbNfcReader');
+        if (message.contains('권한')) {
+          _showFeedback(_Feedback(kind: _FeedbackKind.error, message: message));
+        }
+    }
+  }
+
+  Future<void> _onReaderUid(String uid) async {
+    final cardId = uid.replaceAll(RegExp(r'[\s:-]'), '').toUpperCase();
+    if (cardId.isEmpty) {
+      _showFeedback(
+        const _Feedback(
+          kind: _FeedbackKind.error,
+          message: '카드 일련번호를 읽지 못했습니다.\n카드를 리더기에 다시 태그해주세요.',
         ),
       );
       return;
     }
-    NfcManager.instance.startSession(onDiscovered: _onTag);
+
+    _cardQueue.add(cardId);
+    developer.log(
+      'queued cardId=$cardId queue=${_cardQueue.length}',
+      name: 'CheckinQueue',
+    );
+    unawaited(_drainQueue());
   }
 
-  Future<void> _onTag(NfcTag tag) async {
+  Future<void> _drainQueue() async {
     if (_isProcessing) return;
     _isProcessing = true;
 
-    final cardId = await _extractAttendanceCardId(tag);
-    if (cardId == null) {
-      _showFeedback(
-        const _Feedback(
-          kind: _FeedbackKind.error,
-          message: '카드 일련번호를 읽지 못했습니다.\nNDEF Text가 저장된 카드인지 확인해주세요.',
-        ),
+    while (mounted && _cardQueue.isNotEmpty) {
+      final cardId = _cardQueue.removeFirst();
+      developer.log('processing cardId=$cardId', name: 'CheckinQueue');
+      setState(() {
+        _isSavingAttendance = true;
+        _processingCardId = cardId;
+      });
+
+      final result = await AttendanceService.processTag(
+        attendanceCardId: cardId,
+        academyId: widget.session.academyId,
+        actorRole: widget.session.actorRole,
       );
-      return;
+
+      if (!mounted) return;
+      setState(() {
+        _isSavingAttendance = false;
+        _processingCardId = null;
+      });
+      developer.log(
+        'processed cardId=$cardId result=${result.runtimeType}',
+        name: 'CheckinQueue',
+      );
+      _showAttendanceResult(result);
     }
-    await _processUid(cardId);
+
+    if (!mounted) return;
+    setState(() {
+      _isProcessing = false;
+      _isSavingAttendance = false;
+      _processingCardId = null;
+    });
   }
 
-  Future<void> _processUid(String uid) async {
-    final result = await AttendanceService.processTag(
-      attendanceCardId: uid,
-      academyId: widget.session.academyId,
-      actorRole: widget.session.actorRole,
-    );
-
+  void _showAttendanceResult(AttendanceResult result) {
     switch (result) {
       case AttendanceSuccess(:final student, :final type):
         _showFeedback(
           _Feedback(
             kind: _FeedbackKind.success,
             studentName: student.name,
+            studentClassName: student.className,
             attendanceType: type,
           ),
         );
@@ -132,111 +238,20 @@ class _CheckinScreenState extends State<CheckinScreen>
           _Feedback(
             kind: _FeedbackKind.duplicate,
             studentName: student.name,
+            studentClassName: student.className,
             attendanceType: lastType,
           ),
         );
-      case AttendanceUnknownCard():
+      case AttendanceUnknownCard(:final uid):
         _showFeedback(
-          const _Feedback(
+          _Feedback(
             kind: _FeedbackKind.unknown,
-            message: '등록되지 않은 카드입니다.',
+            message: '등록되지 않은 카드입니다.\n읽힌 카드 ID: $uid',
           ),
         );
       case AttendanceError(:final message):
         _showFeedback(_Feedback(kind: _FeedbackKind.error, message: message));
     }
-  }
-
-  // ── [TEST ONLY] 가상 태깅 — 배포 시 이 메서드 삭제 ───────
-  void _mockTagTap() {
-    if (_isProcessing) return;
-    _isProcessing = true;
-
-    const mockName = '테스트 학생';
-    const duplicateWindow = Duration(minutes: 20);
-    final now = DateTime.now();
-
-    // ① 20분 중복 체크 — 순수 in-memory, 네트워크 완전 무관
-    final lastTime = _lastTestTagTime;
-    if (lastTime != null && now.difference(lastTime) < duplicateWindow) {
-      _showFeedback(
-        _Feedback(
-          kind: _FeedbackKind.duplicate,
-          studentName: mockName,
-          attendanceType: _lastTestTagType,
-        ),
-      );
-      return;
-    }
-
-    // ② 등원 ↔ 하원 토글
-    final nextType = (_lastTestTagType == AttendanceType.arrival)
-        ? AttendanceType.departure
-        : AttendanceType.arrival;
-    final timeStr = DateFormat('HH:mm').format(now);
-
-    // ③ setState로 로컬 리스트·상태 즉시 갱신 (Firestore await 없음)
-    setState(() {
-      _lastTestTagTime = now;
-      _lastTestTagType = nextType;
-      _testLocalRecords.insert(0, {
-        'name': mockName,
-        'time': timeStr,
-        'isArrival': nextType == AttendanceType.arrival,
-      });
-    });
-
-    // ④ Firestore 저장 — fire-and-forget (await 없음 → 무반응 버그 해결)
-    unawaited(
-      FirebaseFirestore.instance
-          .collection('attendance')
-          .add({
-            'studentId': '__mock_student__',
-            'studentName': mockName,
-            'academyId': widget.session.academyId,
-            'type': nextType == AttendanceType.arrival
-                ? 'arrival'
-                : 'departure',
-            'status': nextType == AttendanceType.arrival
-                ? 'present'
-                : 'departed',
-            'lastEditedByRole': widget.session.actorRole == 'teacher'
-                ? 'teacher'
-                : 'director',
-            'editedByAdmin': false,
-            'source': 'checkin_app',
-            'timestamp': Timestamp.fromDate(now),
-            'date': DateFormat('yyyy-MM-dd').format(now),
-          })
-          .then<void>((_) {})
-          .catchError((_) {}),
-    );
-
-    // ⑤ 성공 오버레이 즉시 표시
-    _showFeedback(
-      _Feedback(
-        kind: _FeedbackKind.success,
-        studentName: mockName,
-        attendanceType: nextType,
-      ),
-    );
-  }
-
-  Future<String?> _extractAttendanceCardId(NfcTag tag) async {
-    final ndef = Ndef.from(tag);
-    final message = ndef?.cachedMessage ?? await ndef?.read();
-    final text = _firstTextRecordValue(message);
-    if (text == null || text.isEmpty) return null;
-    return text.replaceAll(RegExp(r'[\s:-]'), '').toUpperCase();
-  }
-
-  String? _firstTextRecordValue(NdefMessage? message) {
-    if (message == null) return null;
-    for (final record in message.records) {
-      final text = decodeNdefTextRecord(record);
-      if (text != null && text.isNotEmpty) return text;
-    }
-    return null;
   }
 
   // ── 피드백 오버레이 제어 ─────────────────────────────────
@@ -246,14 +261,11 @@ class _CheckinScreenState extends State<CheckinScreen>
     _overlayCtrl.forward(from: 0);
 
     _dismissTimer?.cancel();
-    _dismissTimer = Timer(const Duration(seconds: 3), () {
+    _dismissTimer = Timer(const Duration(milliseconds: 1400), () {
       if (!mounted) return;
       _overlayCtrl.reverse().then((_) {
         if (mounted) {
-          setState(() {
-            _feedback = null;
-            _isProcessing = false;
-          });
+          setState(() => _feedback = null);
         }
       });
     });
@@ -301,24 +313,22 @@ class _CheckinScreenState extends State<CheckinScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      // ── [TEST ONLY] 배포 시 floatingActionButton 두 줄 삭제 ─
-      floatingActionButton: _MockTagButton(onTap: _mockTagTap),
-      floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
       body: Stack(
         children: [
           // ── 70 / 30 분할 메인 레이아웃 ───────────────────
           Row(
             children: [
               Expanded(flex: 7, child: const _LeftPanel()),
-              Expanded(
-                flex: 3,
-                child: _RightPanel(
-                  session: widget.session,
-                  localRecords: _testLocalRecords,
-                ),
-              ),
+              Expanded(flex: 3, child: _RightPanel(session: widget.session)),
             ],
           ),
+
+          // ── Firebase 등록중 표시 (리더 이벤트는 계속 수신) ─────────
+          if (_isSavingAttendance)
+            _ProcessingOverlay(
+              queuedCount: _cardQueue.length,
+              cardId: _processingCardId,
+            ),
 
           // ── 피드백 오버레이 (애니메이션) ─────────────────
           if (_feedback != null)
@@ -364,46 +374,6 @@ class _CheckinScreenState extends State<CheckinScreen>
       ),
     );
   }
-}
-
-@visibleForTesting
-String? decodeNdefTextRecord(dynamic record) {
-  final type = record?.type;
-  final payload = record?.payload;
-  if (type is! Uint8List || payload is! Uint8List || payload.isEmpty) {
-    return null;
-  }
-  if (ascii.decode(type, allowInvalid: true) != 'T') return null;
-
-  final status = payload.first;
-  final languageCodeLength = status & 0x3F;
-  final textOffset = 1 + languageCodeLength;
-  if (payload.length <= textOffset) return null;
-
-  final textBytes = payload.sublist(textOffset);
-  final isUtf16 = (status & 0x80) != 0;
-  final decoded = isUtf16
-      ? String.fromCharCodes(_utf16CodeUnits(textBytes))
-      : utf8.decode(textBytes, allowMalformed: true);
-  return decoded.trim().toUpperCase();
-}
-
-List<int> _utf16CodeUnits(Uint8List bytes) {
-  final hasBom =
-      bytes.length >= 2 &&
-      ((bytes[0] == 0xFE && bytes[1] == 0xFF) ||
-          (bytes[0] == 0xFF && bytes[1] == 0xFE));
-  final littleEndian = hasBom && bytes[0] == 0xFF;
-  final start = hasBom ? 2 : 0;
-  final codeUnits = <int>[];
-  for (var i = start; i + 1 < bytes.length; i += 2) {
-    codeUnits.add(
-      littleEndian
-          ? (bytes[i] | (bytes[i + 1] << 8))
-          : ((bytes[i] << 8) | bytes[i + 1]),
-    );
-  }
-  return codeUnits;
 }
 
 // ══════════════════════════════════════════════════════════
@@ -454,7 +424,7 @@ class _LeftPanel extends StatelessWidget {
               ),
               const SizedBox(height: 36),
 
-              // NFC 카드 + 손 아이콘 (심플 조합)
+              // NFC 카드 + 리더기 태그 안내 아이콘
               Stack(
                 alignment: Alignment.center,
                 children: [
@@ -479,7 +449,7 @@ class _LeftPanel extends StatelessWidget {
               ),
               const SizedBox(height: 20),
               const Text(
-                'NFC 카드 또는 스티커를 단말기에 가까이 가져다 대주세요',
+                'NFC 카드 또는 스티커를 리더기에\n가까이 가져다 대주세요',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 26,
@@ -562,8 +532,7 @@ class _BlobPainter extends CustomPainter {
 // ══════════════════════════════════════════════════════════
 class _RightPanel extends StatelessWidget {
   final AcademySession session;
-  final List<Map<String, dynamic>> localRecords;
-  const _RightPanel({required this.session, this.localRecords = const []});
+  const _RightPanel({required this.session});
 
   @override
   Widget build(BuildContext context) {
@@ -634,51 +603,47 @@ class _RightPanel extends StatelessWidget {
 
           // ── 출결 리스트 (로컬 우선, 없으면 Firestore) ────
           Expanded(
-            child: localRecords.isNotEmpty
-                ? _LocalList(records: localRecords)
-                : StreamBuilder<QuerySnapshot>(
-                    stream: FirebaseFirestore.instance
-                        .collection('attendance')
-                        .where('academyId', isEqualTo: session.academyId)
-                        .where('date', isEqualTo: today)
-                        .orderBy('timestamp', descending: true)
-                        .limit(5)
-                        .snapshots(),
-                    builder: (context, snapshot) {
-                      if (snapshot.hasError ||
-                          (snapshot.connectionState ==
-                                  ConnectionState.waiting &&
-                              !snapshot.hasData)) {
-                        return _EmptyList();
-                      }
-                      final docs = snapshot.data?.docs ?? [];
-                      if (docs.isEmpty) return _EmptyList();
-                      return ListView.separated(
-                        padding: const EdgeInsets.symmetric(vertical: 6),
-                        itemCount: docs.length,
-                        separatorBuilder: (_, __) => Divider(
-                          height: 1,
-                          color: Colors.black.withValues(alpha: 0.05),
-                          indent: 18,
-                          endIndent: 18,
-                        ),
-                        itemBuilder: (_, i) {
-                          final data = docs[i].data() as Map<String, dynamic>;
-                          final ts = data['timestamp'] as Timestamp?;
-                          final time = ts != null
-                              ? DateFormat(
-                                  'HH:mm',
-                                ).format(ts.toDate().toLocal())
-                              : DateFormat('HH:mm').format(DateTime.now());
-                          return _AttendanceItem(
-                            name: data['studentName'] as String? ?? '',
-                            time: time,
-                            isArrival: (data['type'] as String?) == 'arrival',
-                          );
-                        },
-                      );
-                    },
+            child: StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance
+                  .collection('attendance')
+                  .where('academyId', isEqualTo: session.academyId)
+                  .where('date', isEqualTo: today)
+                  .orderBy('timestamp', descending: true)
+                  .limit(5)
+                  .snapshots(),
+              builder: (context, snapshot) {
+                if (snapshot.hasError ||
+                    (snapshot.connectionState == ConnectionState.waiting &&
+                        !snapshot.hasData)) {
+                  return _EmptyList();
+                }
+                final docs = snapshot.data?.docs ?? [];
+                if (docs.isEmpty) return _EmptyList();
+                return ListView.separated(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  itemCount: docs.length,
+                  separatorBuilder: (context, index) => Divider(
+                    height: 1,
+                    color: Colors.black.withValues(alpha: 0.05),
+                    indent: 18,
+                    endIndent: 18,
                   ),
+                  itemBuilder: (_, i) {
+                    final data = docs[i].data() as Map<String, dynamic>;
+                    final ts = data['timestamp'] as Timestamp?;
+                    final time = ts != null
+                        ? DateFormat('HH:mm').format(ts.toDate().toLocal())
+                        : DateFormat('HH:mm').format(DateTime.now());
+                    return _AttendanceRecordItem(
+                      data: data,
+                      academyId: session.academyId,
+                      time: time,
+                      isArrival: (data['type'] as String?) == 'arrival',
+                    );
+                  },
+                );
+              },
+            ),
           ),
         ],
       ),
@@ -686,28 +651,52 @@ class _RightPanel extends StatelessWidget {
   }
 }
 
-// ── [TEST ONLY] 로컬 리스트 위젯 — 배포 시 삭제 ─────────
-class _LocalList extends StatelessWidget {
-  final List<Map<String, dynamic>> records;
-  const _LocalList({required this.records});
+class _AttendanceRecordItem extends StatelessWidget {
+  final Map<String, dynamic> data;
+  final String academyId;
+  final String time;
+  final bool isArrival;
+
+  const _AttendanceRecordItem({
+    required this.data,
+    required this.academyId,
+    required this.time,
+    required this.isArrival,
+  });
 
   @override
   Widget build(BuildContext context) {
-    if (records.isEmpty) return _EmptyList();
-    return ListView.separated(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      itemCount: records.length.clamp(0, 5),
-      separatorBuilder: (_, __) => Divider(
-        height: 1,
-        color: Colors.black.withValues(alpha: 0.05),
-        indent: 18,
-        endIndent: 18,
+    final studentName = data['studentName'] as String? ?? '';
+    final savedClassName = data['studentClassName'] as String?;
+    if (_hasText(savedClassName)) {
+      return _AttendanceItem(
+        name: _formatStudentDisplayName(studentName, savedClassName),
+        time: time,
+        isArrival: isArrival,
+      );
+    }
+
+    final studentId = data['studentId'] as String?;
+    if (!_hasText(studentId)) {
+      return _AttendanceItem(
+        name: studentName,
+        time: time,
+        isArrival: isArrival,
+      );
+    }
+
+    return FutureBuilder<String?>(
+      future: _fetchStudentClassName(
+        academyId: academyId,
+        studentId: studentId!.trim(),
       ),
-      itemBuilder: (_, i) => _AttendanceItem(
-        name: records[i]['name'] as String,
-        time: records[i]['time'] as String,
-        isArrival: records[i]['isArrival'] as bool,
-      ),
+      builder: (context, snapshot) {
+        return _AttendanceItem(
+          name: _formatStudentDisplayName(studentName, snapshot.data),
+          time: time,
+          isArrival: isArrival,
+        );
+      },
     );
   }
 }
@@ -820,6 +809,97 @@ class _AttendanceItem extends StatelessWidget {
 }
 
 // ══════════════════════════════════════════════════════════
+// Firebase 등록중 딤 레이어
+// ══════════════════════════════════════════════════════════
+class _ProcessingOverlay extends StatelessWidget {
+  final int queuedCount;
+  final String? cardId;
+
+  const _ProcessingOverlay({required this.queuedCount, required this.cardId});
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Container(
+          color: Colors.black.withValues(alpha: 0.28),
+          child: Align(
+            alignment: Alignment.bottomCenter,
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 34),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 24,
+                  vertical: 16,
+                ),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF171722).withValues(alpha: 0.94),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.12),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.28),
+                      blurRadius: 24,
+                      offset: const Offset(0, 8),
+                    ),
+                  ],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.6,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          '출결 등록 중',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                          ),
+                        ),
+                        if (queuedCount > 0)
+                          Text(
+                            '대기 $queuedCount건',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.white.withValues(alpha: 0.58),
+                            ),
+                          )
+                        else if (cardId != null)
+                          Text(
+                            cardId!,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Colors.white.withValues(alpha: 0.38),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════
 // 피드백 카드 (오버레이 위에 표시)
 // ══════════════════════════════════════════════════════════
 class _FeedbackCard extends StatelessWidget {
@@ -828,14 +908,17 @@ class _FeedbackCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final displayName = _formatStudentDisplayName(
+      feedback.studentName ?? '',
+      feedback.studentClassName,
+    );
+
     return switch (feedback.kind) {
       _FeedbackKind.success => _SuccessCard(
-        name: feedback.studentName ?? '',
+        name: displayName,
         isArrival: feedback.attendanceType == AttendanceType.arrival,
       ),
-      _FeedbackKind.duplicate => _DuplicateCard(
-        name: feedback.studentName ?? '',
-      ),
+      _FeedbackKind.duplicate => _DuplicateCard(name: displayName),
       _FeedbackKind.unknown || _FeedbackKind.error => _AlertCard(
         message: feedback.message ?? '오류가 발생했습니다.',
         isError: feedback.kind == _FeedbackKind.error,
@@ -1005,29 +1088,6 @@ class _AlertCard extends StatelessWidget {
             ),
           ),
         ],
-      ),
-    );
-  }
-}
-
-// ══════════════════════════════════════════════════════════
-// [TEST ONLY] 가상 태깅 버튼 — 배포 시 이 클래스 전체 삭제
-// ══════════════════════════════════════════════════════════
-class _MockTagButton extends StatelessWidget {
-  final VoidCallback onTap;
-  const _MockTagButton({required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return Opacity(
-      opacity: 0.55,
-      child: FloatingActionButton(
-        onPressed: onTap,
-        backgroundColor: Colors.black54,
-        elevation: 2,
-        mini: true,
-        tooltip: '[TEST] 가상 NFC 태깅',
-        child: const Icon(Icons.touch_app, color: Colors.white, size: 20),
       ),
     );
   }

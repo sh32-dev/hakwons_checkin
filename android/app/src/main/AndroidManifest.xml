@@ -2,9 +2,9 @@
 
     <!-- 인터넷 권한 (Firebase 통신 필수) -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- NFC 퍼미션 -->
-    <uses-permission android:name="android.permission.NFC" />
-    <uses-feature android:name="android.hardware.nfc" android:required="true" />
+    <!-- ACR122U USB 리더기 연결 필수 -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
 
     <application
         android:label="학원쓰 출결"
@@ -28,15 +28,14 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
-            <!-- NFC 태깅 시 앱으로 라우팅 -->
+            <!-- ACR122U 연결 시 앱으로 라우팅 -->
             <intent-filter>
-                <action android:name="android.nfc.action.NDEF_DISCOVERED"/>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"/>
                 <category android:name="android.intent.category.DEFAULT"/>
             </intent-filter>
-            <intent-filter>
-                <action android:name="android.nfc.action.TAG_DISCOVERED"/>
-                <category android:name="android.intent.category.DEFAULT"/>
-            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/acr122u_device_filter" />
         </activity>
         <meta-data
             android:name="flutterEmbedding"

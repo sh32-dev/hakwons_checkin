@@ -32,7 +32,6 @@ dependencies:
     sdk: flutter
 
   cupertino_icons: ^1.0.8
-  nfc_manager: ^3.5.0
   firebase_core: ^3.13.0
   firebase_auth: ^5.3.0
   cloud_firestore: ^5.6.6
