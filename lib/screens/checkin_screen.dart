@@ -97,11 +97,6 @@ class _CheckinScreenState extends State<CheckinScreen>
   StreamSubscription<UsbNfcReaderEvent>? _readerSubscription;
   final Queue<String> _cardQueue = Queue<String>();
 
-  // ── [TEST ONLY] 가상 태깅 in-memory 상태 — 배포 시 삭제 ──
-  DateTime? _lastTestTagTime;
-  AttendanceType? _lastTestTagType;
-  final List<Map<String, dynamic>> _testLocalRecords = [];
-
   @override
   void initState() {
     super.initState();
@@ -259,79 +254,6 @@ class _CheckinScreenState extends State<CheckinScreen>
     }
   }
 
-  // ── [TEST ONLY] 가상 태깅 — 배포 시 이 메서드 삭제 ───────
-  void _mockTagTap() {
-    const mockName = '테스트 학생';
-    const duplicateWindow = Duration(minutes: 20);
-    final now = DateTime.now();
-
-    // ① 20분 중복 체크 — 순수 in-memory, 네트워크 완전 무관
-    final lastTime = _lastTestTagTime;
-    if (lastTime != null && now.difference(lastTime) < duplicateWindow) {
-      _showFeedback(
-        _Feedback(
-          kind: _FeedbackKind.duplicate,
-          studentName: mockName,
-          attendanceType: _lastTestTagType,
-        ),
-      );
-      return;
-    }
-
-    // ② 등원 ↔ 하원 토글
-    final nextType = (_lastTestTagType == AttendanceType.arrival)
-        ? AttendanceType.departure
-        : AttendanceType.arrival;
-    final timeStr = DateFormat('HH:mm').format(now);
-
-    // ③ setState로 로컬 리스트·상태 즉시 갱신 (Firestore await 없음)
-    setState(() {
-      _lastTestTagTime = now;
-      _lastTestTagType = nextType;
-      _testLocalRecords.insert(0, {
-        'name': mockName,
-        'className': null,
-        'time': timeStr,
-        'isArrival': nextType == AttendanceType.arrival,
-      });
-    });
-
-    // ④ Firestore 저장 — fire-and-forget (await 없음 → 무반응 버그 해결)
-    unawaited(
-      FirebaseFirestore.instance
-          .collection('attendance')
-          .add({
-            'studentId': '__mock_student__',
-            'studentName': mockName,
-            'academyId': widget.session.academyId,
-            'type': nextType == AttendanceType.arrival
-                ? 'arrival'
-                : 'departure',
-            'status': nextType == AttendanceType.arrival
-                ? 'present'
-                : 'departed',
-            'lastEditedByRole': widget.session.actorRole == 'teacher'
-                ? 'teacher'
-                : 'director',
-            'editedByAdmin': false,
-            'source': 'checkin_app',
-            'timestamp': Timestamp.fromDate(now),
-            'date': DateFormat('yyyy-MM-dd').format(now),
-          })
-          .then<void>((_) {})
-          .catchError((_) {}),
-    );
-
-    // ⑤ 성공 오버레이 즉시 표시
-    _showFeedback(
-      _Feedback(
-        kind: _FeedbackKind.success,
-        studentName: mockName,
-        attendanceType: nextType,
-      ),
-    );
-  }
-
   // ── 피드백 오버레이 제어 ─────────────────────────────────
   void _showFeedback(_Feedback fb) {
     if (!mounted) return;
@@ -391,22 +313,13 @@ class _CheckinScreenState extends State<CheckinScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      // ── [TEST ONLY] 배포 시 floatingActionButton 두 줄 삭제 ─
-      floatingActionButton: _MockTagButton(onTap: _mockTagTap),
-      floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
       body: Stack(
         children: [
           // ── 70 / 30 분할 메인 레이아웃 ───────────────────
           Row(
             children: [
               Expanded(flex: 7, child: const _LeftPanel()),
-              Expanded(
-                flex: 3,
-                child: _RightPanel(
-                  session: widget.session,
-                  localRecords: _testLocalRecords,
-                ),
-              ),
+              Expanded(flex: 3, child: _RightPanel(session: widget.session)),
             ],
           ),
 
@@ -536,7 +449,7 @@ class _LeftPanel extends StatelessWidget {
               ),
               const SizedBox(height: 20),
               const Text(
-                'NFC 카드 또는 스티커를 리더기에 가까이 가져다 대주세요',
+                'NFC 카드 또는 스티커를 리더기에\n가까이 가져다 대주세요',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 26,
@@ -619,8 +532,7 @@ class _BlobPainter extends CustomPainter {
 // ══════════════════════════════════════════════════════════
 class _RightPanel extends StatelessWidget {
   final AcademySession session;
-  final List<Map<String, dynamic>> localRecords;
-  const _RightPanel({required this.session, this.localRecords = const []});
+  const _RightPanel({required this.session});
 
   @override
   Widget build(BuildContext context) {
@@ -691,52 +603,47 @@ class _RightPanel extends StatelessWidget {
 
           // ── 출결 리스트 (로컬 우선, 없으면 Firestore) ────
           Expanded(
-            child: localRecords.isNotEmpty
-                ? _LocalList(records: localRecords)
-                : StreamBuilder<QuerySnapshot>(
-                    stream: FirebaseFirestore.instance
-                        .collection('attendance')
-                        .where('academyId', isEqualTo: session.academyId)
-                        .where('date', isEqualTo: today)
-                        .orderBy('timestamp', descending: true)
-                        .limit(5)
-                        .snapshots(),
-                    builder: (context, snapshot) {
-                      if (snapshot.hasError ||
-                          (snapshot.connectionState ==
-                                  ConnectionState.waiting &&
-                              !snapshot.hasData)) {
-                        return _EmptyList();
-                      }
-                      final docs = snapshot.data?.docs ?? [];
-                      if (docs.isEmpty) return _EmptyList();
-                      return ListView.separated(
-                        padding: const EdgeInsets.symmetric(vertical: 6),
-                        itemCount: docs.length,
-                        separatorBuilder: (context, index) => Divider(
-                          height: 1,
-                          color: Colors.black.withValues(alpha: 0.05),
-                          indent: 18,
-                          endIndent: 18,
-                        ),
-                        itemBuilder: (_, i) {
-                          final data = docs[i].data() as Map<String, dynamic>;
-                          final ts = data['timestamp'] as Timestamp?;
-                          final time = ts != null
-                              ? DateFormat(
-                                  'HH:mm',
-                                ).format(ts.toDate().toLocal())
-                              : DateFormat('HH:mm').format(DateTime.now());
-                          return _AttendanceRecordItem(
-                            data: data,
-                            academyId: session.academyId,
-                            time: time,
-                            isArrival: (data['type'] as String?) == 'arrival',
-                          );
-                        },
-                      );
-                    },
+            child: StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance
+                  .collection('attendance')
+                  .where('academyId', isEqualTo: session.academyId)
+                  .where('date', isEqualTo: today)
+                  .orderBy('timestamp', descending: true)
+                  .limit(5)
+                  .snapshots(),
+              builder: (context, snapshot) {
+                if (snapshot.hasError ||
+                    (snapshot.connectionState == ConnectionState.waiting &&
+                        !snapshot.hasData)) {
+                  return _EmptyList();
+                }
+                final docs = snapshot.data?.docs ?? [];
+                if (docs.isEmpty) return _EmptyList();
+                return ListView.separated(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  itemCount: docs.length,
+                  separatorBuilder: (context, index) => Divider(
+                    height: 1,
+                    color: Colors.black.withValues(alpha: 0.05),
+                    indent: 18,
+                    endIndent: 18,
                   ),
+                  itemBuilder: (_, i) {
+                    final data = docs[i].data() as Map<String, dynamic>;
+                    final ts = data['timestamp'] as Timestamp?;
+                    final time = ts != null
+                        ? DateFormat('HH:mm').format(ts.toDate().toLocal())
+                        : DateFormat('HH:mm').format(DateTime.now());
+                    return _AttendanceRecordItem(
+                      data: data,
+                      academyId: session.academyId,
+                      time: time,
+                      isArrival: (data['type'] as String?) == 'arrival',
+                    );
+                  },
+                );
+              },
+            ),
           ),
         ],
       ),
@@ -790,35 +697,6 @@ class _AttendanceRecordItem extends StatelessWidget {
           isArrival: isArrival,
         );
       },
-    );
-  }
-}
-
-// ── [TEST ONLY] 로컬 리스트 위젯 — 배포 시 삭제 ─────────
-class _LocalList extends StatelessWidget {
-  final List<Map<String, dynamic>> records;
-  const _LocalList({required this.records});
-
-  @override
-  Widget build(BuildContext context) {
-    if (records.isEmpty) return _EmptyList();
-    return ListView.separated(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      itemCount: records.length.clamp(0, 5),
-      separatorBuilder: (context, index) => Divider(
-        height: 1,
-        color: Colors.black.withValues(alpha: 0.05),
-        indent: 18,
-        endIndent: 18,
-      ),
-      itemBuilder: (_, i) => _AttendanceItem(
-        name: _formatStudentDisplayName(
-          records[i]['name'] as String,
-          records[i]['className'] as String?,
-        ),
-        time: records[i]['time'] as String,
-        isArrival: records[i]['isArrival'] as bool,
-      ),
     );
   }
 }
@@ -1210,29 +1088,6 @@ class _AlertCard extends StatelessWidget {
             ),
           ),
         ],
-      ),
-    );
-  }
-}
-
-// ══════════════════════════════════════════════════════════
-// [TEST ONLY] 가상 태깅 버튼 — 배포 시 이 클래스 전체 삭제
-// ══════════════════════════════════════════════════════════
-class _MockTagButton extends StatelessWidget {
-  final VoidCallback onTap;
-  const _MockTagButton({required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return Opacity(
-      opacity: 0.55,
-      child: FloatingActionButton(
-        onPressed: onTap,
-        backgroundColor: Colors.black54,
-        elevation: 2,
-        mini: true,
-        tooltip: '[TEST] 가상 카드 태깅',
-        child: const Icon(Icons.touch_app, color: Colors.white, size: 20),
       ),
     );
   }
