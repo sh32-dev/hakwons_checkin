@@ -1,17 +1,17 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:typed_data';
+import 'dart:collection';
+import 'dart:developer' as developer;
 import 'dart:ui' as ui;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
-import 'package:nfc_manager/nfc_manager.dart';
 
 import '../models/academy_session.dart';
 import '../models/attendance_record.dart';
 import '../services/attendance_service.dart';
 import '../services/auth_service.dart';
+import '../services/usb_nfc_reader_service.dart';
 
 enum _FeedbackKind { success, duplicate, unknown, error }
 
@@ -45,8 +45,12 @@ class _CheckinScreenState extends State<CheckinScreen>
   late final Animation<double> _cardScale;
 
   bool _isProcessing = false;
+  bool _isSavingAttendance = false;
+  String? _processingCardId;
   _Feedback? _feedback;
   Timer? _dismissTimer;
+  StreamSubscription<UsbNfcReaderEvent>? _readerSubscription;
+  final Queue<String> _cardQueue = Queue<String>();
 
   // ── [TEST ONLY] 가상 태깅 in-memory 상태 — 배포 시 삭제 ──
   DateTime? _lastTestTagTime;
@@ -68,56 +72,117 @@ class _CheckinScreenState extends State<CheckinScreen>
       begin: 0.82,
       end: 1.0,
     ).animate(CurvedAnimation(parent: _overlayCtrl, curve: Curves.easeOutBack));
-    _startNfc();
+    _startUsbReader();
   }
 
   @override
   void dispose() {
     _overlayCtrl.dispose();
     _dismissTimer?.cancel();
-    NfcManager.instance.stopSession();
+    _readerSubscription?.cancel();
+    unawaited(UsbNfcReaderService.stop());
     super.dispose();
   }
 
-  // ── NFC ─────────────────────────────────────────────────
-  Future<void> _startNfc() async {
-    final available = await NfcManager.instance.isAvailable();
-    if (!available) {
+  // ── ACR122U USB 리더기 ───────────────────────────────────
+  Future<void> _startUsbReader() async {
+    _readerSubscription = UsbNfcReaderService.events().listen(
+      _handleReaderEvent,
+      onError: (_) {
+        _showFeedback(
+          const _Feedback(
+            kind: _FeedbackKind.error,
+            message: 'USB 리더기 연결을 확인해주세요.',
+          ),
+        );
+      },
+    );
+
+    try {
+      await UsbNfcReaderService.start();
+    } catch (_) {
       _showFeedback(
         const _Feedback(
           kind: _FeedbackKind.error,
-          message: 'NFC를 사용할 수 없습니다.\n기기 설정에서 NFC를 활성화해주세요.',
+          message: 'USB 리더기를 시작하지 못했습니다.\n연결과 권한을 확인해주세요.',
+        ),
+      );
+    }
+  }
+
+  void _handleReaderEvent(UsbNfcReaderEvent event) {
+    switch (event) {
+      case UsbNfcReaderUid(:final uid):
+        _onReaderUid(uid);
+      case UsbNfcReaderError(:final message):
+        _showFeedback(_Feedback(kind: _FeedbackKind.error, message: message));
+      case UsbNfcReaderStatus(:final message):
+        developer.log(message, name: 'UsbNfcReader');
+        if (message.contains('권한')) {
+          _showFeedback(_Feedback(kind: _FeedbackKind.error, message: message));
+        }
+    }
+  }
+
+  Future<void> _onReaderUid(String uid) async {
+    final cardId = uid.replaceAll(RegExp(r'[\s:-]'), '').toUpperCase();
+    if (cardId.isEmpty) {
+      _showFeedback(
+        const _Feedback(
+          kind: _FeedbackKind.error,
+          message: '카드 일련번호를 읽지 못했습니다.\n카드를 리더기에 다시 태그해주세요.',
         ),
       );
       return;
     }
-    NfcManager.instance.startSession(onDiscovered: _onTag);
+
+    _cardQueue.add(cardId);
+    developer.log(
+      'queued cardId=$cardId queue=${_cardQueue.length}',
+      name: 'CheckinQueue',
+    );
+    unawaited(_drainQueue());
   }
 
-  Future<void> _onTag(NfcTag tag) async {
+  Future<void> _drainQueue() async {
     if (_isProcessing) return;
     _isProcessing = true;
 
-    final cardId = await _extractAttendanceCardId(tag);
-    if (cardId == null) {
-      _showFeedback(
-        const _Feedback(
-          kind: _FeedbackKind.error,
-          message: '카드 일련번호를 읽지 못했습니다.\nNDEF Text가 저장된 카드인지 확인해주세요.',
-        ),
+    while (mounted && _cardQueue.isNotEmpty) {
+      final cardId = _cardQueue.removeFirst();
+      developer.log('processing cardId=$cardId', name: 'CheckinQueue');
+      setState(() {
+        _isSavingAttendance = true;
+        _processingCardId = cardId;
+      });
+
+      final result = await AttendanceService.processTag(
+        attendanceCardId: cardId,
+        academyId: widget.session.academyId,
+        actorRole: widget.session.actorRole,
       );
-      return;
+
+      if (!mounted) return;
+      setState(() {
+        _isSavingAttendance = false;
+        _processingCardId = null;
+      });
+      developer.log(
+        'processed cardId=$cardId result=${result.runtimeType}',
+        name: 'CheckinQueue',
+      );
+      _showAttendanceResult(result);
     }
-    await _processUid(cardId);
+
+    if (!mounted) return;
+    setState(() {
+      _isProcessing = false;
+      _isSavingAttendance = false;
+      _processingCardId = null;
+    });
   }
 
-  Future<void> _processUid(String uid) async {
-    final result = await AttendanceService.processTag(
-      attendanceCardId: uid,
-      academyId: widget.session.academyId,
-      actorRole: widget.session.actorRole,
-    );
-
+  void _showAttendanceResult(AttendanceResult result) {
     switch (result) {
       case AttendanceSuccess(:final student, :final type):
         _showFeedback(
@@ -135,11 +200,11 @@ class _CheckinScreenState extends State<CheckinScreen>
             attendanceType: lastType,
           ),
         );
-      case AttendanceUnknownCard():
+      case AttendanceUnknownCard(:final uid):
         _showFeedback(
-          const _Feedback(
+          _Feedback(
             kind: _FeedbackKind.unknown,
-            message: '등록되지 않은 카드입니다.',
+            message: '등록되지 않은 카드입니다.\n읽힌 카드 ID: $uid',
           ),
         );
       case AttendanceError(:final message):
@@ -149,9 +214,6 @@ class _CheckinScreenState extends State<CheckinScreen>
 
   // ── [TEST ONLY] 가상 태깅 — 배포 시 이 메서드 삭제 ───────
   void _mockTagTap() {
-    if (_isProcessing) return;
-    _isProcessing = true;
-
     const mockName = '테스트 학생';
     const duplicateWindow = Duration(minutes: 20);
     final now = DateTime.now();
@@ -222,23 +284,6 @@ class _CheckinScreenState extends State<CheckinScreen>
     );
   }
 
-  Future<String?> _extractAttendanceCardId(NfcTag tag) async {
-    final ndef = Ndef.from(tag);
-    final message = ndef?.cachedMessage ?? await ndef?.read();
-    final text = _firstTextRecordValue(message);
-    if (text == null || text.isEmpty) return null;
-    return text.replaceAll(RegExp(r'[\s:-]'), '').toUpperCase();
-  }
-
-  String? _firstTextRecordValue(NdefMessage? message) {
-    if (message == null) return null;
-    for (final record in message.records) {
-      final text = decodeNdefTextRecord(record);
-      if (text != null && text.isNotEmpty) return text;
-    }
-    return null;
-  }
-
   // ── 피드백 오버레이 제어 ─────────────────────────────────
   void _showFeedback(_Feedback fb) {
     if (!mounted) return;
@@ -246,14 +291,11 @@ class _CheckinScreenState extends State<CheckinScreen>
     _overlayCtrl.forward(from: 0);
 
     _dismissTimer?.cancel();
-    _dismissTimer = Timer(const Duration(seconds: 3), () {
+    _dismissTimer = Timer(const Duration(milliseconds: 1400), () {
       if (!mounted) return;
       _overlayCtrl.reverse().then((_) {
         if (mounted) {
-          setState(() {
-            _feedback = null;
-            _isProcessing = false;
-          });
+          setState(() => _feedback = null);
         }
       });
     });
@@ -320,6 +362,13 @@ class _CheckinScreenState extends State<CheckinScreen>
             ],
           ),
 
+          // ── Firebase 등록중 표시 (리더 이벤트는 계속 수신) ─────────
+          if (_isSavingAttendance)
+            _ProcessingOverlay(
+              queuedCount: _cardQueue.length,
+              cardId: _processingCardId,
+            ),
+
           // ── 피드백 오버레이 (애니메이션) ─────────────────
           if (_feedback != null)
             FadeTransition(
@@ -364,46 +413,6 @@ class _CheckinScreenState extends State<CheckinScreen>
       ),
     );
   }
-}
-
-@visibleForTesting
-String? decodeNdefTextRecord(dynamic record) {
-  final type = record?.type;
-  final payload = record?.payload;
-  if (type is! Uint8List || payload is! Uint8List || payload.isEmpty) {
-    return null;
-  }
-  if (ascii.decode(type, allowInvalid: true) != 'T') return null;
-
-  final status = payload.first;
-  final languageCodeLength = status & 0x3F;
-  final textOffset = 1 + languageCodeLength;
-  if (payload.length <= textOffset) return null;
-
-  final textBytes = payload.sublist(textOffset);
-  final isUtf16 = (status & 0x80) != 0;
-  final decoded = isUtf16
-      ? String.fromCharCodes(_utf16CodeUnits(textBytes))
-      : utf8.decode(textBytes, allowMalformed: true);
-  return decoded.trim().toUpperCase();
-}
-
-List<int> _utf16CodeUnits(Uint8List bytes) {
-  final hasBom =
-      bytes.length >= 2 &&
-      ((bytes[0] == 0xFE && bytes[1] == 0xFF) ||
-          (bytes[0] == 0xFF && bytes[1] == 0xFE));
-  final littleEndian = hasBom && bytes[0] == 0xFF;
-  final start = hasBom ? 2 : 0;
-  final codeUnits = <int>[];
-  for (var i = start; i + 1 < bytes.length; i += 2) {
-    codeUnits.add(
-      littleEndian
-          ? (bytes[i] | (bytes[i + 1] << 8))
-          : ((bytes[i] << 8) | bytes[i + 1]),
-    );
-  }
-  return codeUnits;
 }
 
 // ══════════════════════════════════════════════════════════
@@ -454,7 +463,7 @@ class _LeftPanel extends StatelessWidget {
               ),
               const SizedBox(height: 36),
 
-              // NFC 카드 + 손 아이콘 (심플 조합)
+              // NFC 카드 + 리더기 태그 안내 아이콘
               Stack(
                 alignment: Alignment.center,
                 children: [
@@ -479,7 +488,7 @@ class _LeftPanel extends StatelessWidget {
               ),
               const SizedBox(height: 20),
               const Text(
-                'NFC 카드 또는 스티커를 단말기에 가까이 가져다 대주세요',
+                'NFC 카드 또는 스티커를 리더기에 가까이 가져다 대주세요',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 26,
@@ -656,7 +665,7 @@ class _RightPanel extends StatelessWidget {
                       return ListView.separated(
                         padding: const EdgeInsets.symmetric(vertical: 6),
                         itemCount: docs.length,
-                        separatorBuilder: (_, __) => Divider(
+                        separatorBuilder: (context, index) => Divider(
                           height: 1,
                           color: Colors.black.withValues(alpha: 0.05),
                           indent: 18,
@@ -697,7 +706,7 @@ class _LocalList extends StatelessWidget {
     return ListView.separated(
       padding: const EdgeInsets.symmetric(vertical: 6),
       itemCount: records.length.clamp(0, 5),
-      separatorBuilder: (_, __) => Divider(
+      separatorBuilder: (context, index) => Divider(
         height: 1,
         color: Colors.black.withValues(alpha: 0.05),
         indent: 18,
@@ -814,6 +823,97 @@ class _AttendanceItem extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+// Firebase 등록중 딤 레이어
+// ══════════════════════════════════════════════════════════
+class _ProcessingOverlay extends StatelessWidget {
+  final int queuedCount;
+  final String? cardId;
+
+  const _ProcessingOverlay({required this.queuedCount, required this.cardId});
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Container(
+          color: Colors.black.withValues(alpha: 0.28),
+          child: Align(
+            alignment: Alignment.bottomCenter,
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 34),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 24,
+                  vertical: 16,
+                ),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF171722).withValues(alpha: 0.94),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.12),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.28),
+                      blurRadius: 24,
+                      offset: const Offset(0, 8),
+                    ),
+                  ],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.6,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          '출결 등록 중',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                          ),
+                        ),
+                        if (queuedCount > 0)
+                          Text(
+                            '대기 $queuedCount건',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.white.withValues(alpha: 0.58),
+                            ),
+                          )
+                        else if (cardId != null)
+                          Text(
+                            cardId!,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Colors.white.withValues(alpha: 0.38),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -1026,7 +1126,7 @@ class _MockTagButton extends StatelessWidget {
         backgroundColor: Colors.black54,
         elevation: 2,
         mini: true,
-        tooltip: '[TEST] 가상 NFC 태깅',
+        tooltip: '[TEST] 가상 카드 태깅',
         child: const Icon(Icons.touch_app, color: Colors.white, size: 20),
       ),
     );

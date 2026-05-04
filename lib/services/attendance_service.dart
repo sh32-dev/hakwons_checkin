@@ -29,6 +29,7 @@ class AttendanceError extends AttendanceResult {
 
 class AttendanceService {
   static const _duplicateWindow = Duration(minutes: 20);
+  static const _firestoreTimeout = Duration(seconds: 10);
   static final _firestore = FirebaseFirestore.instance;
   static final _dateFormat = DateFormat('yyyy-MM-dd');
 
@@ -44,7 +45,8 @@ class AttendanceService {
           .where('academyId', isEqualTo: academyId)
           .where('attendanceCardId', isEqualTo: attendanceCardId)
           .limit(1)
-          .get();
+          .get()
+          .timeout(_firestoreTimeout);
 
       if (studentSnap.docs.isEmpty) {
         return AttendanceUnknownCard(uid: attendanceCardId);
@@ -61,7 +63,8 @@ class AttendanceService {
           .where('date', isEqualTo: today)
           .orderBy('timestamp', descending: true)
           .limit(1)
-          .get();
+          .get()
+          .timeout(_firestoreTimeout);
 
       AttendanceType nextType;
 
@@ -95,7 +98,7 @@ class AttendanceService {
         'source': 'checkin_app',
         'timestamp': FieldValue.serverTimestamp(),
         'date': today,
-      });
+      }).timeout(_firestoreTimeout);
 
       return AttendanceSuccess(student: student, type: nextType);
     } catch (e) {
