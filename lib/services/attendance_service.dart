@@ -52,7 +52,10 @@ class AttendanceService {
         return AttendanceUnknownCard(uid: attendanceCardId);
       }
 
-      final student = Student.fromFirestore(studentSnap.docs.first);
+      final student = await _withClassName(
+        Student.fromFirestore(studentSnap.docs.first),
+        academyId,
+      );
 
       // 2. 오늘 날짜의 마지막 출결 기록 조회
       final today = _dateFormat.format(DateTime.now());
@@ -87,22 +90,57 @@ class AttendanceService {
       }
 
       // 3. 출결 기록 저장
-      await _firestore.collection('attendance').add({
-        'studentId': student.id,
-        'studentName': student.name,
-        'academyId': academyId,
-        'type': nextType == AttendanceType.arrival ? 'arrival' : 'departure',
-        'status': nextType == AttendanceType.arrival ? 'present' : 'departed',
-        'lastEditedByRole': actorRole == 'teacher' ? 'teacher' : 'director',
-        'editedByAdmin': false,
-        'source': 'checkin_app',
-        'timestamp': FieldValue.serverTimestamp(),
-        'date': today,
-      }).timeout(_firestoreTimeout);
+      await _firestore
+          .collection('attendance')
+          .add({
+            'studentId': student.id,
+            'studentName': student.name,
+            if (_hasText(student.className))
+              'studentClassName': student.className,
+            'academyId': academyId,
+            'type': nextType == AttendanceType.arrival
+                ? 'arrival'
+                : 'departure',
+            'status': nextType == AttendanceType.arrival
+                ? 'present'
+                : 'departed',
+            'lastEditedByRole': actorRole == 'teacher' ? 'teacher' : 'director',
+            'editedByAdmin': false,
+            'source': 'checkin_app',
+            'timestamp': FieldValue.serverTimestamp(),
+            'date': today,
+          })
+          .timeout(_firestoreTimeout);
 
       return AttendanceSuccess(student: student, type: nextType);
     } catch (e) {
       return AttendanceError(message: e.toString());
     }
   }
+
+  static Future<Student> _withClassName(
+    Student student,
+    String academyId,
+  ) async {
+    final classId = student.classId?.trim();
+    if (!_hasText(classId)) return student;
+
+    try {
+      final classDoc = await _firestore
+          .collection('academies')
+          .doc(academyId)
+          .collection('classes')
+          .doc(classId)
+          .get()
+          .timeout(_firestoreTimeout);
+      final className = classDoc.data()?['name'] as String?;
+      if (!_hasText(className)) return student;
+      return student.copyWith(className: className!.trim());
+    } catch (_) {
+      return student;
+    }
+  }
+
+  static bool _hasText(String? value) =>
+      value != null && value.trim().isNotEmpty;
 }

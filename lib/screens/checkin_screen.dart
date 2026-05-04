@@ -15,17 +15,62 @@ import '../services/usb_nfc_reader_service.dart';
 
 enum _FeedbackKind { success, duplicate, unknown, error }
 
+final Map<String, Future<String?>> _studentClassNameFutures = {};
+
 class _Feedback {
   final _FeedbackKind kind;
   final String? studentName;
+  final String? studentClassName;
   final AttendanceType? attendanceType;
   final String? message;
 
   const _Feedback({
     required this.kind,
     this.studentName,
+    this.studentClassName,
     this.attendanceType,
     this.message,
+  });
+}
+
+String _formatStudentDisplayName(String name, String? className) {
+  final trimmedName = name.trim();
+  final trimmedClassName = className?.trim();
+  if (trimmedClassName == null || trimmedClassName.isEmpty) {
+    return trimmedName;
+  }
+  return '$trimmedName ($trimmedClassName)';
+}
+
+bool _hasText(String? value) => value != null && value.trim().isNotEmpty;
+
+Future<String?> _fetchStudentClassName({
+  required String academyId,
+  required String studentId,
+}) {
+  final cacheKey = '$academyId/$studentId';
+  return _studentClassNameFutures.putIfAbsent(cacheKey, () async {
+    try {
+      final firestore = FirebaseFirestore.instance;
+      final studentDoc = await firestore
+          .collection('students')
+          .doc(studentId)
+          .get();
+      final classId = studentDoc.data()?['classId'] as String?;
+      if (!_hasText(classId)) return null;
+
+      final classDoc = await firestore
+          .collection('academies')
+          .doc(academyId)
+          .collection('classes')
+          .doc(classId!.trim())
+          .get();
+      final className = classDoc.data()?['name'] as String?;
+      if (!_hasText(className)) return null;
+      return className!.trim();
+    } catch (_) {
+      return null;
+    }
   });
 }
 
@@ -189,6 +234,7 @@ class _CheckinScreenState extends State<CheckinScreen>
           _Feedback(
             kind: _FeedbackKind.success,
             studentName: student.name,
+            studentClassName: student.className,
             attendanceType: type,
           ),
         );
@@ -197,6 +243,7 @@ class _CheckinScreenState extends State<CheckinScreen>
           _Feedback(
             kind: _FeedbackKind.duplicate,
             studentName: student.name,
+            studentClassName: student.className,
             attendanceType: lastType,
           ),
         );
@@ -243,6 +290,7 @@ class _CheckinScreenState extends State<CheckinScreen>
       _lastTestTagType = nextType;
       _testLocalRecords.insert(0, {
         'name': mockName,
+        'className': null,
         'time': timeStr,
         'isArrival': nextType == AttendanceType.arrival,
       });
@@ -679,8 +727,9 @@ class _RightPanel extends StatelessWidget {
                                   'HH:mm',
                                 ).format(ts.toDate().toLocal())
                               : DateFormat('HH:mm').format(DateTime.now());
-                          return _AttendanceItem(
-                            name: data['studentName'] as String? ?? '',
+                          return _AttendanceRecordItem(
+                            data: data,
+                            academyId: session.academyId,
                             time: time,
                             isArrival: (data['type'] as String?) == 'arrival',
                           );
@@ -691,6 +740,56 @@ class _RightPanel extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _AttendanceRecordItem extends StatelessWidget {
+  final Map<String, dynamic> data;
+  final String academyId;
+  final String time;
+  final bool isArrival;
+
+  const _AttendanceRecordItem({
+    required this.data,
+    required this.academyId,
+    required this.time,
+    required this.isArrival,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final studentName = data['studentName'] as String? ?? '';
+    final savedClassName = data['studentClassName'] as String?;
+    if (_hasText(savedClassName)) {
+      return _AttendanceItem(
+        name: _formatStudentDisplayName(studentName, savedClassName),
+        time: time,
+        isArrival: isArrival,
+      );
+    }
+
+    final studentId = data['studentId'] as String?;
+    if (!_hasText(studentId)) {
+      return _AttendanceItem(
+        name: studentName,
+        time: time,
+        isArrival: isArrival,
+      );
+    }
+
+    return FutureBuilder<String?>(
+      future: _fetchStudentClassName(
+        academyId: academyId,
+        studentId: studentId!.trim(),
+      ),
+      builder: (context, snapshot) {
+        return _AttendanceItem(
+          name: _formatStudentDisplayName(studentName, snapshot.data),
+          time: time,
+          isArrival: isArrival,
+        );
+      },
     );
   }
 }
@@ -713,7 +812,10 @@ class _LocalList extends StatelessWidget {
         endIndent: 18,
       ),
       itemBuilder: (_, i) => _AttendanceItem(
-        name: records[i]['name'] as String,
+        name: _formatStudentDisplayName(
+          records[i]['name'] as String,
+          records[i]['className'] as String?,
+        ),
         time: records[i]['time'] as String,
         isArrival: records[i]['isArrival'] as bool,
       ),
@@ -928,14 +1030,17 @@ class _FeedbackCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final displayName = _formatStudentDisplayName(
+      feedback.studentName ?? '',
+      feedback.studentClassName,
+    );
+
     return switch (feedback.kind) {
       _FeedbackKind.success => _SuccessCard(
-        name: feedback.studentName ?? '',
+        name: displayName,
         isArrival: feedback.attendanceType == AttendanceType.arrival,
       ),
-      _FeedbackKind.duplicate => _DuplicateCard(
-        name: feedback.studentName ?? '',
-      ),
+      _FeedbackKind.duplicate => _DuplicateCard(name: displayName),
       _FeedbackKind.unknown || _FeedbackKind.error => _AlertCard(
         message: feedback.message ?? '오류가 발생했습니다.',
         isError: feedback.kind == _FeedbackKind.error,
