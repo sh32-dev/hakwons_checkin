@@ -14,7 +14,7 @@
 ### 1. Firebase 연결
 - `flutterfire configure --project=hakwons` 완료
 - `google-services.json`, `firebase_options.dart` 생성됨
-- `android/app/src/main/AndroidManifest.xml`에 INTERNET + NFC 권한 추가
+- `android/app/src/main/AndroidManifest.xml`에 INTERNET + USB Host 설정 추가
 
 ### 2. 로그인 화면 (`lib/screens/login_screen.dart`)
 - **레이아웃**: 5:5 좌우 분할
@@ -34,9 +34,9 @@
   - 중복: 노랑 카드 "이미 기록되었습니다."
   - 오류/미등록: 빨강 카드
 
-### 4. NFC 태깅 로직 (`lib/services/attendance_service.dart`)
-- `nfc_manager` + `platform_tags` 사용
-- NFC UID → `students` 컬렉션 조회 (academyId + nfcUid 복합 쿼리)
+### 4. ACR122U USB 리더기 태깅 로직
+- Android USB Host + ACR122U CCID/APDU 브리지 사용
+- 리더기에서 읽은 NDEF Text → `students` 컬렉션 조회 (academyId + attendanceCardId 복합 쿼리)
 - 출결 토글: 오늘 첫 태깅 → 등원 / 이후 → 등원↔하원 반전
 - **20분 중복 방지**: 마지막 기록 후 20분 이내 재태깅 무시
 
@@ -45,7 +45,7 @@
 students/{id}
   - academyId: String
   - name: String
-  - nfcUid: String  ← 대문자 HEX (예: "AABBCCDD")
+  - attendanceCardId: String  ← NDEF Text에서 읽은 출결 카드 ID
   - grade: String?
 
 attendance/{id}
@@ -70,7 +70,8 @@ lib/
     attendance_record.dart       ← 출결 기록 모델
   services/
     auth_service.dart            ← Phone OTP 로그인 + 테스트 모드
-    attendance_service.dart      ← NFC 태깅 → 출결 처리 로직
+    attendance_service.dart      ← 카드 UID → 출결 처리 로직
+    usb_nfc_reader_service.dart  ← ACR122U 이벤트 브리지
   screens/
     login_screen.dart            ← OTP 로그인 화면
     checkin_screen.dart          ← 출결 대기 + 피드백 화면
@@ -88,7 +89,6 @@ assets/
 ## 주요 패키지
 | 패키지 | 버전 | 용도 |
 |---|---|---|
-| nfc_manager | ^3.5.0 | NFC 태깅 감지 |
 | firebase_core | ^3.13.0 | Firebase 초기화 |
 | firebase_auth | ^5.3.0 | Phone OTP 인증 |
 | cloud_firestore | ^5.6.6 | 학생/출결 데이터 |
@@ -101,12 +101,12 @@ assets/
 ## 내일 해야 할 것
 - [ ] 에뮬레이터 화면 렌더링 문제 해결 (또는 실기기 연결 테스트)
 - [ ] Firebase Authentication에서 Phone 로그인 활성화 확인
-- [ ] Firebase Firestore 복합 인덱스 생성 (academyId + nfcUid on students, academyId + date + timestamp on attendance)
-- [ ] Firestore에 테스트 학생 데이터 등록 (nfcUid 포함)
-- [ ] 실기기 NFC 태깅 테스트
+- [ ] Firebase Firestore 복합 인덱스 생성 (academyId + attendanceCardId on students, academyId + date + timestamp on attendance)
+- [ ] Firestore에 테스트 학생 데이터 등록 (NDEF Text와 같은 attendanceCardId 포함)
+- [ ] 실기기 ACR122U USB 리더기 태깅 테스트
 - [ ] academies 컬렉션 구조 확인 및 학원 정보 연동
 
 ---
 
 ## 에뮬레이터 이슈 (참고)
-에뮬레이터(Android 15, API 35)에서 Google 서버(googleapis.com, firestore.googleapis.com) DNS 해석 실패로 Firebase 연결 불가. 코드 문제 아님 — 실기기에서는 정상 동작. NFC도 에뮬레이터 미지원이므로 실기기 테스트 필수.
+에뮬레이터(Android 15, API 35)에서 Google 서버(googleapis.com, firestore.googleapis.com) DNS 해석 실패로 Firebase 연결 불가. 코드 문제 아님 — 실기기에서는 정상 동작. ACR122U USB 리더기 테스트도 실기기 필요.
