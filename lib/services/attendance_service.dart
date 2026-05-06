@@ -17,6 +17,11 @@ class AttendanceDuplicate extends AttendanceResult {
   AttendanceDuplicate({required this.student, required this.lastType});
 }
 
+class AttendanceCompleted extends AttendanceResult {
+  final Student student;
+  AttendanceCompleted({required this.student});
+}
+
 class AttendanceUnknownCard extends AttendanceResult {
   final String uid;
   AttendanceUnknownCard({required this.uid});
@@ -25,6 +30,24 @@ class AttendanceUnknownCard extends AttendanceResult {
 class AttendanceError extends AttendanceResult {
   final String message;
   AttendanceError({required this.message});
+}
+
+sealed class AttendancePolicyDecision {
+  const AttendancePolicyDecision();
+}
+
+class AttendancePolicyRecord extends AttendancePolicyDecision {
+  final AttendanceType type;
+  const AttendancePolicyRecord(this.type);
+}
+
+class AttendancePolicyDuplicate extends AttendancePolicyDecision {
+  final AttendanceType lastType;
+  const AttendancePolicyDuplicate(this.lastType);
+}
+
+class AttendancePolicyCompleted extends AttendancePolicyDecision {
+  const AttendancePolicyCompleted();
 }
 
 class AttendanceService {
@@ -57,7 +80,7 @@ class AttendanceService {
         academyId,
       );
 
-      // 2. 오늘 날짜의 마지막 출결 기록 조회
+      // 2. 오늘 날짜의 출결 기록 조회
       final today = _dateFormat.format(DateTime.now());
       final attendanceSnap = await _firestore
           .collection('attendance')
@@ -65,7 +88,6 @@ class AttendanceService {
           .where('studentId', isEqualTo: student.id)
           .where('date', isEqualTo: today)
           .orderBy('timestamp', descending: true)
-          .limit(1)
           .get()
           .timeout(_firestoreTimeout);
 
@@ -75,18 +97,18 @@ class AttendanceService {
         // 오늘 첫 태깅 → 등원
         nextType = AttendanceType.arrival;
       } else {
-        final last = AttendanceRecord.fromFirestore(attendanceSnap.docs.first);
-        final elapsed = DateTime.now().difference(last.timestamp);
+        final records = attendanceSnap.docs
+            .map(AttendanceRecord.fromFirestore)
+            .toList(growable: false);
 
-        // 20분 이내 재태깅 → 중복 무시
-        if (elapsed < _duplicateWindow) {
-          return AttendanceDuplicate(student: student, lastType: last.type);
+        switch (decideNextAttendance(records)) {
+          case AttendancePolicyRecord(:final type):
+            nextType = type;
+          case AttendancePolicyDuplicate(:final lastType):
+            return AttendanceDuplicate(student: student, lastType: lastType);
+          case AttendancePolicyCompleted():
+            return AttendanceCompleted(student: student);
         }
-
-        // 이전 기록의 반대로 토글
-        nextType = last.type == AttendanceType.arrival
-            ? AttendanceType.departure
-            : AttendanceType.arrival;
       }
 
       // 3. 출결 기록 저장
@@ -116,6 +138,33 @@ class AttendanceService {
     } catch (e) {
       return AttendanceError(message: e.toString());
     }
+  }
+
+  static AttendancePolicyDecision decideNextAttendance(
+    List<AttendanceRecord> records, {
+    DateTime? now,
+  }) {
+    if (records.isEmpty) {
+      return const AttendancePolicyRecord(AttendanceType.arrival);
+    }
+
+    final orderedRecords = [...records]
+      ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    final last = orderedRecords.first;
+    final hasDeparture = orderedRecords.any(
+      (record) => record.type == AttendanceType.departure,
+    );
+
+    if (hasDeparture || last.type == AttendanceType.departure) {
+      return const AttendancePolicyCompleted();
+    }
+
+    final elapsed = (now ?? DateTime.now()).difference(last.timestamp);
+    if (elapsed < _duplicateWindow) {
+      return AttendancePolicyDuplicate(last.type);
+    }
+
+    return const AttendancePolicyRecord(AttendanceType.departure);
   }
 
   static Future<Student> _withClassName(
