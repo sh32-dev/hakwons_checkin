@@ -45,7 +45,3 @@ android {
 flutter {
     source = "../.."
 }
-
-dependencies {
-    implementation(files("libs/acssmc-1.1.3.jar"))
-}

@@ -13,7 +13,7 @@ import '../services/attendance_service.dart';
 import '../services/auth_service.dart';
 import '../services/usb_nfc_reader_service.dart';
 
-enum _FeedbackKind { success, duplicate, unknown, error }
+enum _FeedbackKind { success, duplicate, completed, unknown, error }
 
 final Map<String, Future<String?>> _studentClassNameFutures = {};
 
@@ -30,6 +30,22 @@ class _Feedback {
     this.studentClassName,
     this.attendanceType,
     this.message,
+  });
+}
+
+class _RecentAttendance {
+  final _FeedbackKind kind;
+  final String studentName;
+  final String? studentClassName;
+  final AttendanceType? attendanceType;
+  final DateTime expiresAt;
+
+  const _RecentAttendance({
+    required this.kind,
+    required this.studentName,
+    required this.studentClassName,
+    required this.attendanceType,
+    required this.expiresAt,
   });
 }
 
@@ -84,6 +100,8 @@ class CheckinScreen extends StatefulWidget {
 
 class _CheckinScreenState extends State<CheckinScreen>
     with SingleTickerProviderStateMixin {
+  static const _localDuplicateWindow = Duration(minutes: 20);
+
   // 피드백 오버레이 애니메이션
   late final AnimationController _overlayCtrl;
   late final Animation<double> _overlayOpacity;
@@ -96,6 +114,7 @@ class _CheckinScreenState extends State<CheckinScreen>
   Timer? _dismissTimer;
   StreamSubscription<UsbNfcReaderEvent>? _readerSubscription;
   final Queue<String> _cardQueue = Queue<String>();
+  final Map<String, _RecentAttendance> _recentAttendanceByCardId = {};
 
   @override
   void initState() {
@@ -176,6 +195,8 @@ class _CheckinScreenState extends State<CheckinScreen>
       return;
     }
 
+    if (_showCachedResultIfRecent(cardId)) return;
+
     _cardQueue.add(cardId);
     developer.log(
       'queued cardId=$cardId queue=${_cardQueue.length}',
@@ -190,6 +211,8 @@ class _CheckinScreenState extends State<CheckinScreen>
 
     while (mounted && _cardQueue.isNotEmpty) {
       final cardId = _cardQueue.removeFirst();
+      if (_showCachedResultIfRecent(cardId)) continue;
+
       developer.log('processing cardId=$cardId', name: 'CheckinQueue');
       setState(() {
         _isSavingAttendance = true;
@@ -211,7 +234,7 @@ class _CheckinScreenState extends State<CheckinScreen>
         'processed cardId=$cardId result=${result.runtimeType}',
         name: 'CheckinQueue',
       );
-      _showAttendanceResult(result);
+      _showAttendanceResult(cardId, result);
     }
 
     if (!mounted) return;
@@ -222,9 +245,64 @@ class _CheckinScreenState extends State<CheckinScreen>
     });
   }
 
-  void _showAttendanceResult(AttendanceResult result) {
+  bool _showCachedResultIfRecent(String cardId) {
+    final recent = _recentAttendanceByCardId[cardId];
+    if (recent == null) return false;
+
+    if (!DateTime.now().isBefore(recent.expiresAt)) {
+      _recentAttendanceByCardId.remove(cardId);
+      return false;
+    }
+
+    developer.log('local cached result cardId=$cardId', name: 'CheckinQueue');
+    _showFeedback(
+      _Feedback(
+        kind: recent.kind,
+        studentName: recent.studentName,
+        studentClassName: recent.studentClassName,
+        attendanceType: recent.attendanceType,
+      ),
+    );
+    return true;
+  }
+
+  void _rememberRecentTag({
+    required String cardId,
+    required _FeedbackKind kind,
+    required String studentName,
+    required String? studentClassName,
+    required AttendanceType? attendanceType,
+    required DateTime expiresAt,
+  }) {
+    _recentAttendanceByCardId[cardId] = _RecentAttendance(
+      kind: kind,
+      studentName: studentName,
+      studentClassName: studentClassName,
+      attendanceType: attendanceType,
+      expiresAt: expiresAt,
+    );
+  }
+
+  DateTime _endOfToday() {
+    final now = DateTime.now();
+    return DateTime(now.year, now.month, now.day + 1);
+  }
+
+  void _showAttendanceResult(String cardId, AttendanceResult result) {
     switch (result) {
       case AttendanceSuccess(:final student, :final type):
+        _rememberRecentTag(
+          cardId: cardId,
+          kind: type == AttendanceType.arrival
+              ? _FeedbackKind.duplicate
+              : _FeedbackKind.completed,
+          studentName: student.name,
+          studentClassName: student.className,
+          attendanceType: type,
+          expiresAt: type == AttendanceType.arrival
+              ? DateTime.now().add(_localDuplicateWindow)
+              : _endOfToday(),
+        );
         _showFeedback(
           _Feedback(
             kind: _FeedbackKind.success,
@@ -234,12 +312,36 @@ class _CheckinScreenState extends State<CheckinScreen>
           ),
         );
       case AttendanceDuplicate(:final student, :final lastType):
+        _rememberRecentTag(
+          cardId: cardId,
+          kind: _FeedbackKind.duplicate,
+          studentName: student.name,
+          studentClassName: student.className,
+          attendanceType: lastType,
+          expiresAt: DateTime.now().add(_localDuplicateWindow),
+        );
         _showFeedback(
           _Feedback(
             kind: _FeedbackKind.duplicate,
             studentName: student.name,
             studentClassName: student.className,
             attendanceType: lastType,
+          ),
+        );
+      case AttendanceCompleted(:final student):
+        _rememberRecentTag(
+          cardId: cardId,
+          kind: _FeedbackKind.completed,
+          studentName: student.name,
+          studentClassName: student.className,
+          attendanceType: null,
+          expiresAt: _endOfToday(),
+        );
+        _showFeedback(
+          _Feedback(
+            kind: _FeedbackKind.completed,
+            studentName: student.name,
+            studentClassName: student.className,
           ),
         );
       case AttendanceUnknownCard(:final uid):
@@ -919,6 +1021,7 @@ class _FeedbackCard extends StatelessWidget {
         isArrival: feedback.attendanceType == AttendanceType.arrival,
       ),
       _FeedbackKind.duplicate => _DuplicateCard(name: displayName),
+      _FeedbackKind.completed => _CompletedCard(name: displayName),
       _FeedbackKind.unknown || _FeedbackKind.error => _AlertCard(
         message: feedback.message ?? '오류가 발생했습니다.',
         isError: feedback.kind == _FeedbackKind.error,
@@ -1040,6 +1143,67 @@ class _DuplicateCard extends StatelessWidget {
             style: TextStyle(
               fontSize: 12,
               color: Colors.white.withValues(alpha: 0.4),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── 오늘 등·하원 완료 ───────────────────────────────────────
+class _CompletedCard extends StatelessWidget {
+  final String name;
+  const _CompletedCard({required this.name});
+
+  @override
+  Widget build(BuildContext context) {
+    const accent = Color(0xFF64B5F6);
+
+    return Container(
+      width: 340,
+      padding: const EdgeInsets.symmetric(horizontal: 36, vertical: 34),
+      decoration: BoxDecoration(
+        color: const Color(0xFF102133).withValues(alpha: 0.92),
+        borderRadius: BorderRadius.circular(28),
+        border: Border.all(color: accent.withValues(alpha: 0.5), width: 1.5),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.35),
+            blurRadius: 40,
+            offset: const Offset(0, 12),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.task_alt_rounded, size: 58, color: accent),
+          const SizedBox(height: 18),
+          Text(
+            name,
+            style: const TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(height: 10),
+          const Text(
+            '오늘 등·하원 기록이 완료되었습니다.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.w700,
+              color: accent,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '추가 태깅은 기록되지 않습니다.',
+            style: TextStyle(
+              fontSize: 12,
+              color: Colors.white.withValues(alpha: 0.45),
             ),
           ),
         ],
