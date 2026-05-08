@@ -21,7 +21,6 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.nio.charset.Charset
-import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 
@@ -215,7 +214,7 @@ class MainActivity : FlutterActivity() {
             eventSink?.success(
                 mapOf(
                     "type" to "uid",
-                    "uid" to uid.replace(Regex("[\\s:-]"), "").uppercase(Locale.US),
+                    "uid" to uid,
                 ),
             )
         }
@@ -428,7 +427,7 @@ private class Acr122uReader(
                 Log.d(LOG_TAG, "ndef message=${ndefMessage.hexPreview(48)}")
                 val text = firstNdefTextRecord(ndefMessage) ?: throw NdefTextNotFoundException()
                 Log.d(LOG_TAG, "ndef text=$text")
-                return text.replace(Regex("[\\s:-]"), "").uppercase(Locale.US)
+                return text
             } catch (error: NdefTextNotFoundException) {
                 throw error
             } catch (error: CardAbsentException) {
