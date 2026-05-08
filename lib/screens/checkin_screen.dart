@@ -4,6 +4,7 @@ import 'dart:developer' as developer;
 import 'dart:ui' as ui;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -59,6 +60,8 @@ String _formatStudentDisplayName(String name, String? className) {
 }
 
 bool _hasText(String? value) => value != null && value.trim().isNotEmpty;
+
+String _redactedCardIdLabel(String cardId) => 'len=${cardId.length}';
 
 Future<String?> _fetchStudentClassName({
   required String academyId,
@@ -131,11 +134,16 @@ class _CheckinScreenState extends State<CheckinScreen>
       begin: 0.82,
       end: 1.0,
     ).animate(CurvedAnimation(parent: _overlayCtrl, curve: Curves.easeOutBack));
+    unawaited(_configureCrashlyticsContext());
     _startUsbReader();
   }
 
   @override
   void dispose() {
+    _logCrashlytics('checkin_screen_disposed', {
+      'screen': 'none',
+      'usb_reader_state': 'stopping',
+    });
     _overlayCtrl.dispose();
     _dismissTimer?.cancel();
     _readerSubscription?.cancel();
@@ -143,11 +151,75 @@ class _CheckinScreenState extends State<CheckinScreen>
     super.dispose();
   }
 
+  Future<void> _configureCrashlyticsContext() async {
+    final crashlytics = FirebaseCrashlytics.instance;
+    await crashlytics.setUserIdentifier(widget.session.academyId);
+    await crashlytics.setCustomKey('screen', 'checkin');
+    await crashlytics.setCustomKey('academy_id', widget.session.academyId);
+    await crashlytics.setCustomKey('actor_role', widget.session.actorRole);
+    await crashlytics.setCustomKey('usb_reader_state', 'initializing');
+    await crashlytics.setCustomKey('pending_queue_count', 0);
+    await crashlytics.log('checkin_screen_opened');
+  }
+
+  void _setCrashlyticsKeys(Map<String, Object> keys) {
+    final crashlytics = FirebaseCrashlytics.instance;
+    for (final entry in keys.entries) {
+      unawaited(crashlytics.setCustomKey(entry.key, entry.value));
+    }
+  }
+
+  void _logCrashlytics(String message, [Map<String, Object> keys = const {}]) {
+    unawaited(FirebaseCrashlytics.instance.log(message));
+    if (keys.isNotEmpty) {
+      _setCrashlyticsKeys(keys);
+    }
+  }
+
+  String _attendanceResultName(AttendanceResult result) => switch (result) {
+    AttendanceSuccess() => 'success',
+    AttendanceDuplicate() => 'duplicate',
+    AttendanceCompleted() => 'completed',
+    AttendanceUnknownCard() => 'unknown_card',
+    AttendanceError() => 'error',
+  };
+
+  void _logAttendanceResult(AttendanceResult result) {
+    final keys = <String, Object>{
+      'last_attendance_result': _attendanceResultName(result),
+      'pending_queue_count': _cardQueue.length,
+    };
+
+    switch (result) {
+      case AttendanceSuccess(:final type):
+        keys['last_attendance_type'] = type.name;
+      case AttendanceDuplicate(:final lastType):
+        keys['last_attendance_type'] = lastType.name;
+      case AttendanceCompleted():
+        keys['last_attendance_type'] = 'completed';
+      case AttendanceUnknownCard():
+        keys['last_attendance_type'] = 'unknown';
+      case AttendanceError():
+        keys['last_attendance_type'] = 'error';
+    }
+
+    _logCrashlytics(
+      'attendance_result_${keys['last_attendance_result']}',
+      keys,
+    );
+  }
+
   // ── ACR122U USB 리더기 ───────────────────────────────────
   Future<void> _startUsbReader() async {
+    _logCrashlytics('usb_reader_start_requested', {
+      'usb_reader_state': 'starting',
+    });
     _readerSubscription = UsbNfcReaderService.events().listen(
       _handleReaderEvent,
       onError: (_) {
+        _logCrashlytics('usb_reader_stream_error', {
+          'usb_reader_state': 'stream_error',
+        });
         _showFeedback(
           const _Feedback(
             kind: _FeedbackKind.error,
@@ -159,7 +231,11 @@ class _CheckinScreenState extends State<CheckinScreen>
 
     try {
       await UsbNfcReaderService.start();
+      _logCrashlytics('usb_reader_started', {'usb_reader_state': 'started'});
     } catch (_) {
+      _logCrashlytics('usb_reader_start_failed', {
+        'usb_reader_state': 'start_failed',
+      });
       _showFeedback(
         const _Feedback(
           kind: _FeedbackKind.error,
@@ -172,12 +248,24 @@ class _CheckinScreenState extends State<CheckinScreen>
   void _handleReaderEvent(UsbNfcReaderEvent event) {
     switch (event) {
       case UsbNfcReaderUid(:final uid):
+        _logCrashlytics('nfc_uid_received', {
+          'last_reader_event': 'uid',
+          'last_card_id_length': uid.length,
+        });
         _onReaderUid(uid);
       case UsbNfcReaderError(:final message):
+        _logCrashlytics('usb_reader_event_error', {
+          'last_reader_event': 'error',
+          'usb_reader_state': 'event_error',
+        });
         _showFeedback(_Feedback(kind: _FeedbackKind.error, message: message));
       case UsbNfcReaderStatus(:final message):
         developer.log(message, name: 'UsbNfcReader');
+        _setCrashlyticsKeys({'last_reader_event': 'status'});
         if (message.contains('권한')) {
+          _logCrashlytics('usb_reader_permission_required', {
+            'usb_reader_state': 'permission_required',
+          });
           _showFeedback(_Feedback(kind: _FeedbackKind.error, message: message));
         }
     }
@@ -186,6 +274,9 @@ class _CheckinScreenState extends State<CheckinScreen>
   Future<void> _onReaderUid(String uid) async {
     final cardId = uid;
     if (cardId.isEmpty) {
+      _logCrashlytics('nfc_empty_card_id', {
+        'last_attendance_result': 'empty_card_id',
+      });
       _showFeedback(
         const _Feedback(
           kind: _FeedbackKind.error,
@@ -199,24 +290,38 @@ class _CheckinScreenState extends State<CheckinScreen>
 
     _cardQueue.add(cardId);
     developer.log(
-      'queued cardId=$cardId queue=${_cardQueue.length}',
+      'queued cardId=${_redactedCardIdLabel(cardId)} queue=${_cardQueue.length}',
       name: 'CheckinQueue',
     );
+    _logCrashlytics('attendance_card_queued', {
+      'pending_queue_count': _cardQueue.length,
+    });
     unawaited(_drainQueue());
   }
 
   Future<void> _drainQueue() async {
     if (_isProcessing) return;
     _isProcessing = true;
+    _logCrashlytics('attendance_queue_processing_started', {
+      'is_processing': true,
+      'pending_queue_count': _cardQueue.length,
+    });
 
     while (mounted && _cardQueue.isNotEmpty) {
       final cardId = _cardQueue.removeFirst();
       if (_showCachedResultIfRecent(cardId)) continue;
 
-      developer.log('processing cardId=$cardId', name: 'CheckinQueue');
+      developer.log(
+        'processing cardId=${_redactedCardIdLabel(cardId)}',
+        name: 'CheckinQueue',
+      );
       setState(() {
         _isSavingAttendance = true;
         _processingCardId = cardId;
+      });
+      _logCrashlytics('attendance_process_started', {
+        'is_saving_attendance': true,
+        'pending_queue_count': _cardQueue.length,
       });
 
       final result = await AttendanceService.processTag(
@@ -231,9 +336,11 @@ class _CheckinScreenState extends State<CheckinScreen>
         _processingCardId = null;
       });
       developer.log(
-        'processed cardId=$cardId result=${result.runtimeType}',
+        'processed cardId=${_redactedCardIdLabel(cardId)} '
+        'result=${result.runtimeType}',
         name: 'CheckinQueue',
       );
+      _logAttendanceResult(result);
       _showAttendanceResult(cardId, result);
     }
 
@@ -242,6 +349,11 @@ class _CheckinScreenState extends State<CheckinScreen>
       _isProcessing = false;
       _isSavingAttendance = false;
       _processingCardId = null;
+    });
+    _logCrashlytics('attendance_queue_processing_finished', {
+      'is_processing': false,
+      'is_saving_attendance': false,
+      'pending_queue_count': 0,
     });
   }
 
@@ -254,7 +366,14 @@ class _CheckinScreenState extends State<CheckinScreen>
       return false;
     }
 
-    developer.log('local cached result cardId=$cardId', name: 'CheckinQueue');
+    developer.log(
+      'local cached result cardId=${_redactedCardIdLabel(cardId)}',
+      name: 'CheckinQueue',
+    );
+    _logCrashlytics('attendance_recent_cache_hit', {
+      'last_attendance_result': 'recent_cache_hit',
+      'pending_queue_count': _cardQueue.length,
+    });
     _showFeedback(
       _Feedback(
         kind: recent.kind,
@@ -407,7 +526,9 @@ class _CheckinScreenState extends State<CheckinScreen>
       ),
     );
     if (ok == true && mounted) {
+      _logCrashlytics('logout_confirmed', {'screen': 'logout'});
       await AuthService.logout();
+      unawaited(FirebaseCrashlytics.instance.setUserIdentifier(''));
       if (mounted) Navigator.of(context).pushReplacementNamed('/login');
     }
   }

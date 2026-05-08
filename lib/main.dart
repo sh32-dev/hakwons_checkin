@@ -1,4 +1,7 @@
+import 'dart:ui';
+
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -13,9 +16,14 @@ import 'services/auth_service.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  // Flutter framework 및 비동기 uncaught error를 Crashlytics에 fatal로 기록
+  FlutterError.onError = FirebaseCrashlytics.instance.recordFlutterFatalError;
+  PlatformDispatcher.instance.onError = (error, stack) {
+    FirebaseCrashlytics.instance.recordError(error, stack, fatal: true);
+    return true;
+  };
 
   // 오프라인 환경에서도 폰트가 동작하도록 런타임 패칭 비활성화
   GoogleFonts.config.allowRuntimeFetching = false;
@@ -50,9 +58,7 @@ class HagwonsCheckinApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      routes: {
-        '/login': (_) => const LoginScreen(),
-      },
+      routes: {'/login': (_) => const LoginScreen()},
       home: const _InitRouter(),
     );
   }
@@ -93,7 +99,10 @@ class _SplashScreen extends StatelessWidget {
     return const Scaffold(
       backgroundColor: Color(0xFF0D1117),
       body: Center(
-        child: CircularProgressIndicator(color: Colors.blueAccent, strokeWidth: 2),
+        child: CircularProgressIndicator(
+          color: Colors.blueAccent,
+          strokeWidth: 2,
+        ),
       ),
     );
   }
