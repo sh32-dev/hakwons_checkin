@@ -184,7 +184,7 @@ class _CheckinScreenState extends State<CheckinScreen>
   }
 
   Future<void> _onReaderUid(String uid) async {
-    final cardId = uid.replaceAll(RegExp(r'[\s:-]'), '').toUpperCase();
+    final cardId = uid;
     if (cardId.isEmpty) {
       _showFeedback(
         const _Feedback(
